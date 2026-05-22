@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"server/internal/config"
 	"server/internal/middleware"
@@ -136,6 +137,16 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		})
 	}
 
+	EmitAuthEvent(AuthEvent{
+		Type:      "user_registered",
+		AppID:     "",
+		AppName:   "System",
+		UserID:    user.ID.String(),
+		Username:  user.Username,
+		Email:     user.Email,
+		Timestamp: user.CreatedAt,
+	})
+
 	Created(c, UserResponse{
 		ID:            user.ID.String(),
 		Email:         user.Email,
@@ -187,6 +198,16 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			"source":   "direct",
 		})
 	}
+
+	EmitAuthEvent(AuthEvent{
+		Type:      "user_login",
+		AppID:     "",
+		AppName:   "System",
+		UserID:    user.ID.String(),
+		Username:  user.Username,
+		Email:     user.Email,
+		Timestamp: time.Now(),
+	})
 
 	/* 设置 httpOnly Cookie 和 CSRF Token */
 	h.setAuthCookies(c, tokens)

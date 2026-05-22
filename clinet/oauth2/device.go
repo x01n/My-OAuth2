@@ -169,12 +169,11 @@ func (c *Client) DeviceFlow(ctx context.Context, scope string) (*Token, error) {
 		return nil, err
 	}
 
-	// Display instructions to user
+	visitURL := ResolveDeviceVerificationURL(c.GetAPIBaseURL(), deviceAuth)
 	fmt.Println("\n=== Device Authorization ===")
-	fmt.Printf("Please visit: %s\n", deviceAuth.VerificationURI)
-	fmt.Printf("And enter code: %s\n", deviceAuth.UserCode)
-	if deviceAuth.VerificationURIComplete != "" {
-		fmt.Printf("\nOr visit: %s\n", deviceAuth.VerificationURIComplete)
+	fmt.Printf("Please visit: %s\n", visitURL)
+	if deviceAuth.UserCode != "" && !strings.Contains(visitURL, deviceAuth.UserCode) {
+		fmt.Printf("And enter code: %s\n", deviceAuth.UserCode)
 	}
 	fmt.Println("\nWaiting for authorization...")
 

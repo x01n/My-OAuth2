@@ -70,20 +70,18 @@ func runCallbackDeviceFlow(client *oauth2.Client) {
 			if auth, ok := data.(*oauth2.DeviceAuthResponse); ok {
 				fmt.Println()
 				fmt.Println("┌─────────────────────────────────────────────┐")
-				fmt.Printf("│  请访问: %-34s │\n", auth.VerificationURI)
-				fmt.Printf("│  输入验证码: %-30s │\n", auth.UserCode)
+				visitURL := oauth2.ResolveDeviceVerificationURL(client.GetAPIBaseURL(), auth)
+				fmt.Printf("│  请访问 OAuth 站点: %-26s │\n", truncate(visitURL, 26))
+				fmt.Printf("│  验证码: %-34s │\n", auth.UserCode)
 				fmt.Println("├─────────────────────────────────────────────┤")
-				if auth.VerificationURIComplete != "" {
-					fmt.Printf("│  或直接打开: %-30s │\n",
-						truncate(auth.VerificationURIComplete, 30))
-				}
+				fmt.Printf("│  完整链接: %-34s │\n", truncate(visitURL, 34))
 				fmt.Printf("│  有效期: %d 秒%-30s │\n", auth.ExpiresIn, "")
 				fmt.Println("└─────────────────────────────────────────────┘")
 				fmt.Println("\n⏳ 等待用户授权...")
 
 				// 尝试自动打开浏览器
-				if auth.VerificationURIComplete != "" {
-					openBrowser(auth.VerificationURIComplete)
+				if visitURL != "" {
+					openBrowser(visitURL)
 				}
 			}
 		case "pending":

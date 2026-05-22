@@ -33,6 +33,13 @@ type PasswordResetService struct {
 	frontendURL string
 }
 
+/**
+ * NewPasswordResetService 创建密码重置服务实例
+ *
+ * @param  {repository.UserRepository}          userRepo  - 用户仓储
+ * @param  {repository.PasswordResetRepository} resetRepo - 密码重置仓储
+ * @returns {*PasswordResetService}
+ */
 func NewPasswordResetService(
 	userRepo *repository.UserRepository,
 	resetRepo *repository.PasswordResetRepository,
@@ -54,9 +61,17 @@ func (s *PasswordResetService) SetOAuthRepo(repo *repository.OAuthRepository) {
 	s.oauthRepo = repo
 }
 
-// RequestPasswordReset 请求密码重置
-// 如果配置了邮件服务，会发送重置链接到用户邮箱
-// 返回值: token (开发环境) 或空字符串 (生产环境，通过邮件发送)
+/**
+ * RequestPasswordReset 请求密码重置
+ *
+ * @description
+ *   如果配置了邮件服务，会发送重置链接到用户邮箱；开发环境可直接返回 token。
+ *
+ * @param  {string} userEmail  - 用户邮箱
+ * @param  {string} ipAddress  - 请求来源 IP
+ * @param  {string} userAgent  - 请求来源 UA
+ * @returns {(string, error)} token（开发环境）或空字符串（生产环境）
+ */
 func (s *PasswordResetService) RequestPasswordReset(userEmail, ipAddress, userAgent string) (string, error) {
 	// 查找用户
 	user, err := s.userRepo.FindByEmail(userEmail)
@@ -113,7 +128,12 @@ func (s *PasswordResetService) RequestPasswordReset(userEmail, ipAddress, userAg
 	return token, nil
 }
 
-// ValidateResetToken 验证重置令牌
+/**
+ * ValidateResetToken 验证重置令牌
+ *
+ * @param  {string} token - 重置令牌
+ * @returns {(*model.User, error)}
+ */
 func (s *PasswordResetService) ValidateResetToken(token string) (*model.User, error) {
 	reset, err := s.resetRepo.FindValidByToken(token)
 	if err != nil {
@@ -138,7 +158,13 @@ func (s *PasswordResetService) ValidateResetToken(token string) (*model.User, er
 	return user, nil
 }
 
-// ResetPassword 重置密码
+/**
+ * ResetPassword 使用重置令牌更新用户密码
+ *
+ * @param  {string} token       - 重置令牌
+ * @param  {string} newPassword - 新密码
+ * @returns {error}
+ */
 func (s *PasswordResetService) ResetPassword(token, newPassword string) error {
 	// 验证令牌
 	reset, err := s.resetRepo.FindValidByToken(token)
@@ -196,6 +222,11 @@ func (s *PasswordResetService) ResetPassword(token, newPassword string) error {
 		_ = s.oauthRepo.RevokeUserAuthRefreshTokens(user.ID)
 	}
 
+	/* 同时吊销所有已签发的 access token，避免旧会话继续存活到过期 */
+	if s.oauthRepo != nil {
+		_ = s.oauthRepo.RevokeTokensByUserID(user.ID)
+	}
+
 	// 入队发送密码重置成功通知邮件
 	if s.emailQueue != nil {
 		username := user.Username
@@ -208,7 +239,15 @@ func (s *PasswordResetService) ResetPassword(token, newPassword string) error {
 	return nil
 }
 
-// AdminRequestPasswordReset 管理员发起的密码重置（跳过限流）
+/**
+ * AdminRequestPasswordReset 管理员发起密码重置
+ *
+ * @description 跳过频率限制，但仍走相同的令牌创建和邮件投递链路。
+ * @param  {string} userEmail  - 用户邮箱
+ * @param  {string} ipAddress  - 请求来源 IP
+ * @param  {string} userAgent  - 请求来源 UA
+ * @returns {(string, error)}
+ */
 func (s *PasswordResetService) AdminRequestPasswordReset(userEmail, ipAddress, userAgent string) (string, error) {
 	// 查找用户
 	user, err := s.userRepo.FindByEmail(userEmail)
@@ -256,7 +295,11 @@ func (s *PasswordResetService) AdminRequestPasswordReset(userEmail, ipAddress, u
 	return token, nil
 }
 
-// CleanupExpiredTokens 清理过期令牌
+/**
+ * CleanupExpiredTokens 清理过期重置令牌
+ *
+ * @returns {error}
+ */
 func (s *PasswordResetService) CleanupExpiredTokens() error {
 	return s.resetRepo.DeleteExpired()
 }

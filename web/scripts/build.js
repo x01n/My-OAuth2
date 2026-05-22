@@ -28,10 +28,11 @@ function copyDir(src, dest) {
 console.log('[build] 清理 dist 目录...');
 fs.rmSync(DIST, { recursive: true, force: true });
 fs.mkdirSync(DIST, { recursive: true });
+fs.writeFileSync(path.join(DIST, 'placeholder.txt'), 'placeholder\n');
 
 /* 2. 执行 next build */
 console.log('[build] 执行 next build...');
-execSync('bunx next build', { cwd: ROOT, stdio: 'inherit' });
+execSync('bunx next build --webpack', { cwd: ROOT, stdio: 'inherit' });
 
 /* 3. 复制 out → dist */
 console.log('[build] 复制构建产物到 dist...');

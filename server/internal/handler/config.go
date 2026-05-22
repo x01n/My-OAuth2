@@ -15,8 +15,9 @@ import (
  * 功能：处理系统配置的读取、更新、公开配置查询等 HTTP 请求
  */
 type ConfigHandler struct {
-	configRepo *repository.ConfigRepository
-	cfg        *config.Config
+	configRepo       *repository.ConfigRepository
+	cachedConfigRepo *repository.CachedConfigRepository
+	cfg              *config.Config
 }
 
 /*
@@ -30,6 +31,11 @@ func NewConfigHandler(configRepo *repository.ConfigRepository, cfg ...*config.Co
 		h.cfg = cfg[0]
 	}
 	return h
+}
+
+/* SetCachedConfigRepo 注入带缓存的配置仓储 */
+func (h *ConfigHandler) SetCachedConfigRepo(repo *repository.CachedConfigRepository) {
+	h.cachedConfigRepo = repo
 }
 
 /*
@@ -113,13 +119,22 @@ func (h *ConfigHandler) DeleteConfig(c *gin.Context) {
 // GetPublicConfig returns public config values (no auth required)
 // GET /api/config
 func (h *ConfigHandler) GetPublicConfig(c *gin.Context) {
+	if h.cachedConfigRepo != nil && h.cfg != nil {
+		publicConfigs, err := h.cachedConfigRepo.GetPublicConfig(&h.cfg.Server.AllowRegistration)
+		if err != nil {
+			InternalError(c, "Failed to get configs")
+			return
+		}
+		Success(c, publicConfigs)
+		return
+	}
+
 	configs, err := h.configRepo.GetAll()
 	if err != nil {
 		InternalError(c, "Failed to get configs")
 		return
 	}
 
-	// Only return public config keys
 	publicKeys := []string{
 		model.ConfigKeyFrontendURL,
 		model.ConfigKeyServerURL,
@@ -133,7 +148,6 @@ func (h *ConfigHandler) GetPublicConfig(c *gin.Context) {
 		}
 	}
 
-	/* 从运行时配置中追加注册开关 */
 	if h.cfg != nil {
 		publicConfigs["allow_registration"] = fmt.Sprintf("%v", h.cfg.Server.AllowRegistration)
 	}

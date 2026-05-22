@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	gctx "server/internal/context"
@@ -76,8 +77,7 @@ func (h *DeviceHandler) DeviceAuthorization(c *gin.Context) {
 		return
 	}
 
-	// Check if device_code grant is allowed
-	if !app.SupportsGrantType("urn:ietf:params:oauth:grant-type:device_code") && !app.SupportsGrantType("device_code") {
+	if !app.SupportsGrantType("device_code") {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":             "unauthorized_client",
 			"error_description": "Client is not authorized to use device authorization grant",
@@ -85,19 +85,20 @@ func (h *DeviceHandler) DeviceAuthorization(c *gin.Context) {
 		return
 	}
 
-	// Build verification URI
-	verificationURI := h.frontendURL + "/device"
-	if h.frontendURL == "" {
-		verificationURI = h.baseURL + "/device"
+	if !app.ValidateUserAuthorizationScope(req.Scope) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_scope",
+			"error_description": "Requested scope is not allowed for this application",
+		})
+		return
 	}
 
 	// Create device code
 	deviceCode := &model.DeviceCode{
-		ClientID:        req.ClientID,
-		Scope:           req.Scope,
-		VerificationURI: verificationURI,
-		ExpiresAt:       time.Now().Add(30 * time.Minute), // 30 minutes expiry
-		Interval:        5,
+		ClientID:  req.ClientID,
+		Scope:     req.Scope,
+		ExpiresAt: time.Now().Add(30 * time.Minute), // 30 minutes expiry
+		Interval:  5,
 	}
 
 	if err := h.deviceRepo.Create(deviceCode); err != nil {
@@ -108,8 +109,10 @@ func (h *DeviceHandler) DeviceAuthorization(c *gin.Context) {
 		return
 	}
 
-	// Set verification_uri_complete with user_code
-	deviceCode.VerificationURIComplete = verificationURI + "?user_code=" + deviceCode.UserCode
+	oauthRoot := RequestOAuthRoot(c.Request, h.baseURL, h.frontendURL)
+	deviceCode.VerificationURI, deviceCode.VerificationURIComplete = DeviceVerificationURLs(
+		oauthRoot, deviceCode.UserCode,
+	)
 
 	c.JSON(http.StatusOK, DeviceAuthorizationResponse{
 		DeviceCode:              deviceCode.DeviceCode,
@@ -153,15 +156,32 @@ func (h *DeviceHandler) GetDeviceInfo(c *gin.Context) {
 		return
 	}
 
+	scopes := strings.Fields(dc.Scope)
+	if len(scopes) == 0 && dc.Scope != "" {
+		scopes = []string{dc.Scope}
+	}
+	oauthRoot := RequestOAuthRoot(c.Request, h.baseURL, h.frontendURL)
+	verificationURI, _ := DeviceVerificationURLs(oauthRoot, dc.UserCode)
+
 	Success(c, gin.H{
-		"user_code": dc.UserCode,
-		"scope":     dc.Scope,
+		"user_code":          dc.UserCode,
+		"scope":              dc.Scope,
+		"scopes":             scopes,
+		"verification_uri":   verificationURI,
+		"expires_in":         int(time.Until(dc.ExpiresAt).Seconds()),
+		"requested_scopes":   scopes,
+		"issued_token_types": app.GetIssuedTokenTypes(),
 		"app": gin.H{
-			"id":          app.ID.String(),
-			"name":        app.Name,
-			"description": app.Description,
+			"id":                         app.ID.String(),
+			"client_id":                  app.ClientID,
+			"name":                       app.Name,
+			"description":                app.Description,
+			"scopes":                     app.GetOIDCScopes(),
+			"allowed_scopes":             app.GetAllowedScopes(),
+			"grant_types":                app.GetGrantTypes(),
+			"response_types_supported":   app.GetResponseTypesSupported(),
+			"issued_token_types":         app.GetIssuedTokenTypes(),
 		},
-		"expires_in": int(time.Until(dc.ExpiresAt).Seconds()),
 	})
 }
 
@@ -205,13 +225,35 @@ func (h *DeviceHandler) DeviceAuthorizeSubmit(c *gin.Context) {
 	}
 
 	if req.Consent == "allow" {
-		// Authorize the device
 		if err := h.deviceRepo.Authorize(req.UserCode, userID); err != nil {
 			InternalError(c, "Failed to authorize device")
 			return
 		}
+		app, _ := h.appRepo.FindByClientID(dc.ClientID)
+		username, _ := gctx.GetUserUsername(c)
+		email, _ := gctx.GetUserEmail(c)
+		emitDeviceAuthorizedSSE(app, userID.String(), username, email, dc.Scope)
+		scopes := strings.Fields(dc.Scope)
+		authInfo := gin.H{
+			"scope":  dc.Scope,
+			"scopes": scopes,
+			"user": gin.H{
+				"id":       userID.String(),
+				"username": username,
+				"email":    email,
+			},
+		}
+		if app != nil {
+			authInfo["issued_token_types"] = app.GetIssuedTokenTypes()
+			authInfo["app"] = gin.H{
+				"id":        app.ID.String(),
+				"client_id": app.ClientID,
+				"name":      app.Name,
+			}
+		}
 		Success(c, gin.H{
-			"message": "Device authorized successfully",
+			"message":       "Device authorized successfully",
+			"authorization": authInfo,
 		})
 	} else {
 		// Deny the device

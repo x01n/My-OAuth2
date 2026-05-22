@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import path from "node:path";
 
 /* 生成构建ID：日期 + 短时间戳哈希，格式如 250214-a3f8 */
 const now = new Date();
@@ -20,8 +21,18 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   reactStrictMode: true,
   compress: true,
+  webpack: (config) => {
+    config.resolve = config.resolve || {};
+    config.resolve.alias = {
+      ...(config.resolve.alias || {}),
+      '@': path.resolve(process.cwd()),
+    };
+    return config;
+  },
   /* Turbopack 兼容（Next.js 16 默认） */
-  turbopack: {},
+  turbopack: {
+    root: process.cwd(),
+  },
   /* Next.js 16 自动生成的 .next/types/validator.ts 存在类型导出缺陷，跳过构建时类型检查 */
   typescript: {
     ignoreBuildErrors: true,

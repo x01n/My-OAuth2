@@ -230,6 +230,11 @@ func (r *LoginLogRepository) CountActiveUsers(duration time.Duration) (int64, er
 	return count, result.Error
 }
 
+/* DeleteByUserID 删除用户的所有登录日志 */
+func (r *LoginLogRepository) DeleteByUserID(userID uuid.UUID) error {
+	return r.db.Delete(&model.LoginLog{}, "user_id = ?", userID).Error
+}
+
 /* CountTodayLogins 统计今日登录数 */
 func (r *LoginLogRepository) CountTodayLogins() (int64, error) {
 	var count int64

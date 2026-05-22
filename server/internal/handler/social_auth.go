@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
@@ -144,7 +145,7 @@ func (h *SocialAuthHandler) Callback(c *gin.Context) {
 
 	// 验证state
 	savedState, _ := c.Cookie("oauth_state")
-	if savedState == "" || savedState != state {
+	if savedState == "" || !hmac.Equal([]byte(savedState), []byte(state)) {
 		redirectWithError("invalid_state")
 		return
 	}

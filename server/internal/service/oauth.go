@@ -11,22 +11,62 @@ import (
 	"server/internal/config"
 	"server/internal/model"
 	"server/internal/repository"
+	"server/pkg/jwt"
 
 	"github.com/google/uuid"
 )
 
-/* OAuth2 服务层错误定义 */
+/**
+ * OAuth2 服务层错误定义
+ * @enum {error}
+ */
 var (
-	ErrInvalidClient       = errors.New("invalid client")
-	ErrInvalidRedirectURI  = errors.New("invalid redirect uri")
-	ErrInvalidGrant        = errors.New("invalid grant")
-	ErrInvalidScope        = errors.New("invalid scope")
-	ErrAuthCodeExpired     = errors.New("authorization code expired")
-	ErrAuthCodeUsed        = errors.New("authorization code already used")
+	/** 客户端凭据无效 */
+	ErrInvalidClient = errors.New("invalid client")
+
+	/** redirect_uri 不在白名单 */
+	ErrInvalidRedirectURI = errors.New("invalid redirect uri")
+
+	/** 授权信息无效（code/refresh_token/subject_token 等） */
+	ErrInvalidGrant = errors.New("invalid grant")
+
+	/** scope 超出允许范围 */
+	ErrInvalidScope = errors.New("invalid scope")
+
+	/** 授权码已过期 */
+	ErrAuthCodeExpired = errors.New("authorization code expired")
+
+	/** 授权码已被使用 */
+	ErrAuthCodeUsed = errors.New("authorization code already used")
+
+	/** PKCE code_verifier 不匹配 */
 	ErrInvalidCodeVerifier = errors.New("invalid code verifier")
-	ErrTokenExpired        = errors.New("token expired")
-	ErrTokenRevoked        = errors.New("token revoked")
+
+	/** access token 已过期 */
+	ErrTokenExpired = errors.New("token expired")
+
+	/** access token 已被撤销 */
+	ErrTokenRevoked = errors.New("token revoked")
+
+	/** 令牌无用户上下文（如 client_credentials），不能用于 UserInfo 等终端用户 API */
+	ErrNoUserInToken = errors.New("token has no associated user")
 )
+
+/**
+ * splitScopeSet 将空格分隔 scope 串转换为 set
+ *
+ * @param  {string} scope - 空格分隔的 scope 字符串
+ * @returns {map[string]bool} key 为 scope 名的 set
+ */
+func splitScopeSet(scope string) map[string]bool {
+	set := make(map[string]bool)
+	for _, s := range strings.Fields(scope) {
+		if s != "" {
+			set[s] = true
+		}
+	}
+	return set
+}
 
 /*
  * OAuthService OAuth2 核心服务
@@ -39,6 +79,7 @@ type OAuthService struct {
 	userRepo     *repository.UserRepository
 	userAuthRepo *repository.UserAuthorizationRepository
 	deviceRepo   *repository.DeviceCodeRepository
+	jwtManager   *jwt.Manager
 	config       *config.Config
 }
 
@@ -88,6 +129,7 @@ type AuthorizeResult struct {
 	Code        string
 	RedirectURI string
 	State       string
+	Reused      bool // 复用未兑换的授权码（重复提交）
 }
 
 /*
@@ -102,6 +144,19 @@ func (s *OAuthService) Authorize(input *AuthorizeInput) (*AuthorizeResult, error
 	app, err := s.appRepo.FindByClientID(input.ClientID)
 	if err != nil {
 		return nil, ErrInvalidClient
+	}
+
+	if !app.SupportsGrantType("authorization_code") {
+		return nil, ErrInvalidGrant
+	}
+
+	if !app.ValidateUserAuthorizationScope(input.Scope) {
+		return nil, ErrInvalidScope
+	}
+
+	user, err := s.userRepo.FindByID(input.UserID)
+	if err != nil || user.IsSuspended() {
+		return nil, ErrAccessDenied
 	}
 
 	// Validate redirect URI
@@ -129,7 +184,17 @@ func (s *OAuthService) Authorize(input *AuthorizeInput) (*AuthorizeResult, error
 		}
 	}
 
-	// Create authorization code
+	if existing, err := s.oauthRepo.FindReusableAuthorizationCode(
+		input.UserID, input.ClientID, input.RedirectURI, input.Scope, input.CodeChallenge,
+	); err == nil && existing != nil {
+		return &AuthorizeResult{
+			Code:        existing.Code,
+			RedirectURI: input.RedirectURI,
+			State:       input.State,
+			Reused:      true,
+		}, nil
+	}
+
 	authCode := &model.AuthorizationCode{
 		ClientID:            input.ClientID,
 		UserID:              input.UserID,
@@ -144,7 +209,6 @@ func (s *OAuthService) Authorize(input *AuthorizeInput) (*AuthorizeResult, error
 		return nil, err
 	}
 
-	// Record user authorization for the app
 	if s.userAuthRepo != nil {
 		s.userAuthRepo.CreateOrUpdate(input.UserID, app.ID, input.Scope, "authorization_code")
 	}
@@ -153,6 +217,25 @@ func (s *OAuthService) Authorize(input *AuthorizeInput) (*AuthorizeResult, error
 		Code:        authCode.Code,
 		RedirectURI: input.RedirectURI,
 		State:       input.State,
+		Reused:      false,
+	}, nil
+}
+
+/*
+ * FindPendingAuthorization 查找可复用的授权码（授权页加载时用于自动跳转）
+ */
+func (s *OAuthService) FindPendingAuthorization(input *AuthorizeInput) (*AuthorizeResult, error) {
+	existing, err := s.oauthRepo.FindReusableAuthorizationCode(
+		input.UserID, input.ClientID, input.RedirectURI, input.Scope, input.CodeChallenge,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &AuthorizeResult{
+		Code:        existing.Code,
+		RedirectURI: input.RedirectURI,
+		State:       input.State,
+		Reused:      true,
 	}, nil
 }
 
@@ -181,12 +264,13 @@ type TokenInput struct {
 	Resource           string // Target resource
 }
 
-/* TokenResult OAuth2 Token 响应结构 */
+/* TokenResult OAuth2/OIDC Token 响应结构（RFC 6749 + OIDC） */
 type TokenResult struct {
 	AccessToken  string `json:"access_token"`
 	TokenType    string `json:"token_type"`
 	ExpiresIn    int64  `json:"expires_in"`
 	RefreshToken string `json:"refresh_token,omitempty"`
+	IDToken      string `json:"id_token,omitempty"`
 	Scope        string `json:"scope,omitempty"`
 }
 
@@ -242,6 +326,10 @@ func (s *OAuthService) exchangeAuthorizationCode(input *TokenInput) (*TokenResul
 		return nil, ErrInvalidClient
 	}
 
+	if authCode.ClientID != input.ClientID {
+		return nil, ErrInvalidGrant
+	}
+
 	/*
 	 * 客户端认证策略：
 	 *   - 机密客户端（confidential/machine）必须提供有效的 client_secret
@@ -270,9 +358,26 @@ func (s *OAuthService) exchangeAuthorizationCode(input *TokenInput) (*TokenResul
 		}
 	}
 
-	// Mark authorization code as used
-	if err := s.oauthRepo.MarkAuthorizationCodeUsed(input.Code); err != nil {
+	/*
+	 * Mark authorization code as used — 原子抢占
+	 * L-4 修复：仅当本调用拿到 RowsAffected==1 才继续签发 token，
+	 * 否则代表已有并发请求消费过该 code → RFC 6749 §4.1.2 要求拒绝重复兑换。
+	 */
+	claimed, err := s.oauthRepo.MarkAuthorizationCodeUsed(input.Code)
+	if err != nil {
 		return nil, err
+	}
+	if !claimed {
+		return nil, ErrAuthCodeUsed
+	}
+
+	user, err := s.userRepo.FindByID(authCode.UserID)
+	if err != nil || user.IsSuspended() {
+		return nil, ErrAccessDenied
+	}
+
+	if !app.SupportsGrantType("authorization_code") {
+		return nil, ErrInvalidGrant
 	}
 
 	// Create access token
@@ -283,27 +388,32 @@ func (s *OAuthService) exchangeAuthorizationCode(input *TokenInput) (*TokenResul
 		ExpiresAt: time.Now().Add(s.config.OAuth.AccessTokenTTL),
 	}
 
-	if err := s.oauthRepo.CreateAccessToken(accessToken); err != nil {
+	if err := s.persistUserAccessToken(accessToken, user); err != nil {
 		return nil, err
 	}
 
-	// Create refresh token
+	uid := authCode.UserID
 	refreshToken := &model.RefreshToken{
 		AccessTokenID: &accessToken.ID,
+		UserID:        &uid,
 		ExpiresAt:     time.Now().Add(s.config.OAuth.RefreshTokenTTL),
 	}
 
-	if err := s.oauthRepo.CreateRefreshToken(refreshToken); err != nil {
+	if err := s.persistUserRefreshToken(refreshToken, user, input.ClientID, authCode.Scope); err != nil {
 		return nil, err
 	}
 
-	return &TokenResult{
+	result := &TokenResult{
 		AccessToken:  accessToken.Token,
 		TokenType:    "Bearer",
 		ExpiresIn:    int64(s.config.OAuth.AccessTokenTTL.Seconds()),
 		RefreshToken: refreshToken.Token,
 		Scope:        authCode.Scope,
-	}, nil
+	}
+	if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, authCode.Scope); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 /*
@@ -349,23 +459,50 @@ func (s *OAuthService) refreshAccessToken(input *TokenInput) (*TokenResult, erro
 	if err != nil {
 		return nil, ErrInvalidGrant
 	}
+	if !oldAccessToken.IsValid() {
+		return nil, ErrTokenRevoked
+	}
 
-	/* 检查用户对该应用的授权是否已被撤销 */
-	if oldAccessToken.UserID != nil && s.userAuthRepo != nil {
-		app, appErr := s.appRepo.FindByClientID(oldAccessToken.ClientID)
-		if appErr == nil {
-			auth, authErr := s.userAuthRepo.FindByUserAndApp(*oldAccessToken.UserID, app.ID)
-			if authErr != nil || !auth.IsValid() {
-				/* 授权已撤销或不存在，拒绝刷新 */
-				s.oauthRepo.RevokeRefreshToken(input.RefreshToken)
-				return nil, ErrAccessDenied
-			}
+	app, err := s.appRepo.FindByClientID(input.ClientID)
+	if err != nil {
+		return nil, ErrInvalidClient
+	}
+	if oldAccessToken.ClientID != input.ClientID {
+		return nil, ErrInvalidGrant
+	}
+	if !app.SupportsGrantType("refresh_token") {
+		return nil, ErrInvalidGrant
+	}
+
+	var user *model.User
+	if oldAccessToken.UserID != nil {
+		var uErr error
+		user, uErr = s.userRepo.FindByID(*oldAccessToken.UserID)
+		if uErr != nil || user.IsSuspended() {
+			return nil, ErrAccessDenied
 		}
 	}
 
-	// Revoke old tokens
+	/* 检查用户对该应用的授权是否已被撤销 */
+	if oldAccessToken.UserID != nil && s.userAuthRepo != nil {
+		auth, authErr := s.userAuthRepo.FindByUserAndApp(*oldAccessToken.UserID, app.ID)
+		if authErr != nil || !auth.IsValid() {
+			_, _ = s.oauthRepo.RevokeRefreshToken(input.RefreshToken)
+			return nil, ErrAccessDenied
+		}
+	}
+
+	/*
+	 * L-9 修复：原子抢占 refresh token 撤销
+	 * 并发场景：两个 client 同时用同一个 refresh_token 调 /oauth/token，
+	 * 旧代码两个都通过 Revoked=false 校验并签出 token。
+	 * 新代码用 RowsAffected==1 抢占，只有一个能继续签发。
+	 */
+	claimed, err := s.oauthRepo.RevokeRefreshToken(input.RefreshToken)
+	if err != nil || !claimed {
+		return nil, ErrInvalidGrant
+	}
 	s.oauthRepo.RevokeAccessToken(oldAccessToken.Token)
-	s.oauthRepo.RevokeRefreshToken(input.RefreshToken)
 
 	// Create new access token
 	accessToken := &model.AccessToken{
@@ -375,27 +512,33 @@ func (s *OAuthService) refreshAccessToken(input *TokenInput) (*TokenResult, erro
 		ExpiresAt: time.Now().Add(s.config.OAuth.AccessTokenTTL),
 	}
 
-	if err := s.oauthRepo.CreateAccessToken(accessToken); err != nil {
+	if err := s.persistUserAccessToken(accessToken, user); err != nil {
 		return nil, err
 	}
 
-	// Create new refresh token
 	newRefreshToken := &model.RefreshToken{
 		AccessTokenID: &accessToken.ID,
+		UserID:        oldAccessToken.UserID,
 		ExpiresAt:     time.Now().Add(s.config.OAuth.RefreshTokenTTL),
 	}
 
-	if err := s.oauthRepo.CreateRefreshToken(newRefreshToken); err != nil {
+	if err := s.persistUserRefreshToken(newRefreshToken, user, oldAccessToken.ClientID, oldAccessToken.Scope); err != nil {
 		return nil, err
 	}
 
-	return &TokenResult{
+	result := &TokenResult{
 		AccessToken:  accessToken.Token,
 		TokenType:    "Bearer",
 		ExpiresIn:    int64(s.config.OAuth.AccessTokenTTL.Seconds()),
 		RefreshToken: newRefreshToken.Token,
 		Scope:        oldAccessToken.Scope,
-	}, nil
+	}
+	if user != nil {
+		if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, oldAccessToken.Scope); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 /*
@@ -421,27 +564,16 @@ func (s *OAuthService) clientCredentials(input *TokenInput) (*TokenResult, error
 		return nil, ErrInvalidGrant
 	}
 
-	// Check if client_credentials grant is allowed for this application
 	if !app.SupportsGrantType("client_credentials") {
 		return nil, ErrInvalidGrant
 	}
 
-	// Validate requested scope
-	if !app.ValidateScope(input.Scope) {
+	scope, ok := app.ResolveClientCredentialsScope(input.Scope)
+	if !ok {
 		return nil, ErrInvalidScope
 	}
 
-	// Determine the scope to use
-	scope := input.Scope
-	if scope == "" {
-		// Use default allowed scopes if no scope requested
-		allowedScopes := app.GetAllowedScopes()
-		if len(allowedScopes) > 0 {
-			scope = strings.Join(allowedScopes, " ")
-		}
-	}
-
-	// Create access token (no user associated - UserID will be zero UUID)
+	// Create access token (no end-user — UserID stays nil)
 	accessToken := &model.AccessToken{
 		ClientID:  input.ClientID,
 		Scope:     scope,
@@ -521,18 +653,44 @@ func (s *OAuthService) deviceCodeGrant(input *TokenInput) (*TokenResult, error) 
 	case "denied":
 		return nil, ErrAccessDenied
 	case "authorized":
-		// Continue to issue token
+		/* 继续尝试原子消费 */
+	case "consumed":
+		return nil, ErrInvalidGrant
 	default:
 		return nil, ErrInvalidGrant
 	}
+
+	/*
+	 * L-5 修复：原子消费 device_code，防止并发轮询重复签发 token。
+	 * 只有第一个把 authorized -> consumed 的请求可以继续；其余并发请求直接失败。
+	 */
+	claimedDC, claimed, err := s.deviceRepo.ConsumeAuthorizedDeviceCode(input.DeviceCode)
+	if err != nil {
+		return nil, ErrInvalidGrant
+	}
+	if !claimed {
+		return nil, ErrInvalidGrant
+	}
+	dc = claimedDC
 
 	// Get user
 	if dc.UserID == nil {
 		return nil, ErrInvalidGrant
 	}
 	user, err := s.userRepo.FindByID(*dc.UserID)
+	if err != nil || user.IsSuspended() {
+		return nil, ErrAccessDenied
+	}
+
+	app, err := s.appRepo.FindByClientID(input.ClientID)
 	if err != nil {
+		return nil, ErrInvalidClient
+	}
+	if !app.SupportsGrantType("device_code") {
 		return nil, ErrInvalidGrant
+	}
+	if !app.ValidateUserAuthorizationScope(dc.Scope) {
+		return nil, ErrInvalidScope
 	}
 
 	// Create access token
@@ -543,22 +701,19 @@ func (s *OAuthService) deviceCodeGrant(input *TokenInput) (*TokenResult, error) 
 		ExpiresAt: time.Now().Add(s.config.OAuth.AccessTokenTTL),
 	}
 
-	if err := s.oauthRepo.CreateAccessToken(accessToken); err != nil {
+	if err := s.persistUserAccessToken(accessToken, user); err != nil {
 		return nil, err
 	}
 
-	// Create refresh token
 	refreshToken := &model.RefreshToken{
 		AccessTokenID: &accessToken.ID,
+		UserID:        dc.UserID,
 		ExpiresAt:     time.Now().Add(s.config.OAuth.RefreshTokenTTL),
 	}
 
-	if err := s.oauthRepo.CreateRefreshToken(refreshToken); err != nil {
+	if err := s.persistUserRefreshToken(refreshToken, user, input.ClientID, dc.Scope); err != nil {
 		return nil, err
 	}
-
-	// Delete the device code after successful token exchange
-	s.deviceRepo.Delete(dc.ID)
 
 	// Record user authorization
 	if s.userAuthRepo != nil {
@@ -568,13 +723,17 @@ func (s *OAuthService) deviceCodeGrant(input *TokenInput) (*TokenResult, error) 
 		}
 	}
 
-	return &TokenResult{
+	result := &TokenResult{
 		AccessToken:  accessToken.Token,
 		TokenType:    "Bearer",
 		ExpiresIn:    int64(s.config.OAuth.AccessTokenTTL.Seconds()),
 		RefreshToken: refreshToken.Token,
 		Scope:        dc.Scope,
-	}, nil
+	}
+	if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, dc.Scope); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 /* Token 类型 URI 常量 (RFC 8693 Token Exchange) */
@@ -606,7 +765,11 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 		input.SubjectTokenType = TokenTypeAccessToken // Default to access_token
 	}
 
-	/* 强制要求客户端认证（RFC 8693 安全要求） */
+	/*
+	 * 强制要求客户端认证（RFC 8693 安全要求）
+	 * 安全加固（M-4）：禁止 public 应用使用 token-exchange — 公开客户端无法安全持有 secret，
+	 * 不应被赋予委托/降权能力，否则会被前端 XSS / 移动端逆向直接利用。
+	 */
 	if input.ClientID == "" {
 		return nil, ErrInvalidClient
 	}
@@ -615,26 +778,24 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 		return nil, ErrInvalidClient
 	}
 
-	/* 机密客户端 / 机器客户端必须提供有效 secret */
-	if app.AppType == model.AppTypeConfidential || app.AppType == model.AppTypeMachine {
-		if input.ClientSecret == "" || subtle.ConstantTimeCompare([]byte(app.ClientSecret), []byte(input.ClientSecret)) != 1 {
-			return nil, ErrInvalidClient
-		}
-	} else if input.ClientSecret != "" {
-		/* 公开客户端提供了 secret，也需要校验 */
-		if subtle.ConstantTimeCompare([]byte(app.ClientSecret), []byte(input.ClientSecret)) != 1 {
-			return nil, ErrInvalidClient
-		}
+	/* 仅 confidential / machine 允许 token-exchange */
+	if app.AppType != model.AppTypeConfidential && app.AppType != model.AppTypeMachine {
+		return nil, ErrInvalidClient
 	}
 
-	/* 检查 token-exchange 授权类型是否允许 */
-	if !app.SupportsGrantType("urn:ietf:params:oauth:grant-type:token-exchange") && !app.SupportsGrantType("token-exchange") && !app.SupportsGrantType("token_exchange") {
+	/* 机密客户端 / 机器客户端必须提供有效 secret */
+	if input.ClientSecret == "" || subtle.ConstantTimeCompare([]byte(app.ClientSecret), []byte(input.ClientSecret)) != 1 {
+		return nil, ErrInvalidClient
+	}
+
+	if !app.SupportsGrantType("token_exchange") {
 		return nil, ErrInvalidGrant
 	}
 
 	// Validate subject token based on type
 	var user *model.User
 	var originalScope string
+	var subjectClientID string /* 持有 subject_token 的原 client_id（用于 C-3 跨 client 校验） */
 
 	switch input.SubjectTokenType {
 	case TokenTypeAccessToken, "access_token":
@@ -643,8 +804,13 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 		if err != nil {
 			return nil, ErrInvalidGrant
 		}
+		/* client_credentials 签发的 access_token 无用户上下文，禁止作为 subject_token 交换 */
+		if u == nil || !accessToken.HasEndUser() {
+			return nil, ErrInvalidGrant
+		}
 		user = u
 		originalScope = accessToken.Scope
+		subjectClientID = accessToken.ClientID
 
 	case TokenTypeRefreshToken, "refresh_token":
 		// Validate as refresh token
@@ -659,7 +825,7 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 		if err != nil {
 			return nil, ErrInvalidGrant
 		}
-		if accessToken.UserID == nil {
+		if !accessToken.HasEndUser() {
 			return nil, ErrInvalidGrant
 		}
 		user, err = s.userRepo.FindByID(*accessToken.UserID)
@@ -667,9 +833,22 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 			return nil, ErrInvalidGrant
 		}
 		originalScope = accessToken.Scope
+		subjectClientID = accessToken.ClientID
 
 	default:
 		return nil, errors.New("unsupported subject_token_type")
+	}
+
+	/*
+	 * C-3 修复：subject_token 必须来自调用方自己的 client；禁止跨 client 委派
+	 * （否则 app B 持有 secret 后用 app A 的 token 作为 subject_token 即可签出指向 app A 用户的 token）
+	 */
+	if subjectClientID == "" || subjectClientID != input.ClientID {
+		return nil, ErrInvalidGrant
+	}
+
+	if user.IsSuspended() {
+		return nil, ErrAccessDenied
 	}
 
 	// Validate actor token if provided (delegation scenario)
@@ -687,14 +866,29 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 		}
 	}
 
-	// Determine scope for new token
+	/*
+	 * C-2 修复：scope 严格子集校验
+	 * 规则：结果 scope ⊆ originalScope 且 ⊆ 应用 Scopes/AllowedScopes 白名单
+	 */
 	scope := input.Scope
 	if scope == "" {
 		scope = originalScope
-	} else {
-		// Validate requested scope is subset of original scope
-		// For now, we allow any scope that was in the original token
-		// More strict validation can be added here
+	}
+	if model.ScopeContainsWildcard(scope) {
+		return nil, ErrInvalidScope
+	}
+	appAllowedSet := splitScopeSet(strings.Join(append(app.GetAllowedScopes(), app.GetScopes()...), " "))
+	if len(appAllowedSet) == 0 {
+		return nil, ErrInvalidScope
+	}
+	originalSet := splitScopeSet(originalScope)
+	for _, s := range strings.Fields(scope) {
+		if s == "" {
+			continue
+		}
+		if !originalSet[s] || !appAllowedSet[s] {
+			return nil, ErrInvalidScope
+		}
 	}
 
 	// Determine the issued token type
@@ -713,7 +907,7 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 		newAccessToken.UserID = &user.ID
 	}
 
-	if err := s.oauthRepo.CreateAccessToken(newAccessToken); err != nil {
+	if err := s.persistUserAccessToken(newAccessToken, user); err != nil {
 		return nil, err
 	}
 
@@ -722,9 +916,10 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 	if requestedType == TokenTypeRefreshToken {
 		newRefreshToken = &model.RefreshToken{
 			AccessTokenID: &newAccessToken.ID,
+			UserID:        newAccessToken.UserID,
 			ExpiresAt:     time.Now().Add(s.config.OAuth.RefreshTokenTTL),
 		}
-		if err := s.oauthRepo.CreateRefreshToken(newRefreshToken); err != nil {
+		if err := s.persistUserRefreshToken(newRefreshToken, user, input.ClientID, scope); err != nil {
 			return nil, err
 		}
 	}
@@ -740,14 +935,29 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 		result.RefreshToken = newRefreshToken.Token
 	}
 
+	if user != nil {
+		if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, scope); err != nil {
+			return nil, err
+		}
+	}
+
 	return result, nil
 }
 
-/*
- * ValidateAccessToken 校验访问令牌并返回关联的用户
- * @param token - 访问令牌字符串
- * @return *model.User        - 关联用户（client_credentials 模式时为 nil）
- * @return *model.AccessToken  - 令牌实体
+/**
+ * ValidateAccessToken 校验访问令牌并返回关联的用户与令牌实体
+ *
+ * @description
+ *   完整校验链：DB 查 token → 校验未过期未撤销 → 拉取关联用户 →
+ *   **校验用户状态**（active）— 禁用用户的 token 立即失效（L-3 修复）。
+ *
+ * @param  {string} token - 访问令牌字符串
+ * @returns {(*model.User, *model.AccessToken, error)}
+ *   user 在 client_credentials 模式下为 nil
+ * @throws {ErrTokenExpired}  token 在 DB 中找不到
+ * @throws {ErrTokenRevoked}  token 已撤销 / 过期
+ * @throws {ErrAccessDenied}  关联用户已禁用
+ * @security 用户从 active → disabled/suspended 后，其现有 token 立即在 API 鉴权层失效
  */
 func (s *OAuthService) ValidateAccessToken(token string) (*model.User, *model.AccessToken, error) {
 	accessToken, err := s.oauthRepo.FindAccessToken(token)
@@ -759,14 +969,19 @@ func (s *OAuthService) ValidateAccessToken(token string) (*model.User, *model.Ac
 		return nil, nil, ErrTokenRevoked
 	}
 
-	if accessToken.UserID == nil {
-		// Client credentials token — no user associated
+	if !accessToken.HasEndUser() {
+		/* Client credentials token — no user associated */
 		return nil, accessToken, nil
 	}
 
 	user, err := s.userRepo.FindByID(*accessToken.UserID)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	/* L-3 修复：禁用 / 停用用户的 token 立即失效 */
+	if user.IsSuspended() || user.Status == "disabled" {
+		return nil, nil, ErrAccessDenied
 	}
 
 	return user, accessToken, nil
@@ -795,7 +1010,7 @@ func (s *OAuthService) RevokeToken(token, tokenTypeHint string) error {
 		if err != nil {
 			return err
 		}
-		_ = s.oauthRepo.RevokeRefreshToken(token)
+		_, _ = s.oauthRepo.RevokeRefreshToken(token)
 		if rt.AccessTokenID != nil {
 			if at, atErr := s.oauthRepo.FindAccessTokenByID(*rt.AccessTokenID); atErr == nil {
 				_ = s.oauthRepo.RevokeAccessToken(at.Token)
@@ -810,7 +1025,7 @@ func (s *OAuthService) RevokeToken(token, tokenTypeHint string) error {
 			return nil
 		}
 		if rt, err := s.oauthRepo.FindRefreshToken(token); err == nil {
-			_ = s.oauthRepo.RevokeRefreshToken(token)
+			_, _ = s.oauthRepo.RevokeRefreshToken(token)
 			if rt.AccessTokenID != nil {
 				if at, atErr := s.oauthRepo.FindAccessTokenByID(*rt.AccessTokenID); atErr == nil {
 					_ = s.oauthRepo.RevokeAccessToken(at.Token)
@@ -833,6 +1048,9 @@ func (s *OAuthService) GetUserInfoWithScope(token string) (*model.User, string, 
 	if err != nil {
 		return nil, "", err
 	}
+	if user == nil {
+		return nil, "", ErrNoUserInToken
+	}
 	scope := ""
 	if accessToken != nil {
 		scope = accessToken.Scope
@@ -846,7 +1064,7 @@ func (s *OAuthService) GetUserInfoWithScope(token string) (*model.User, string, 
  * @return *model.User - 用户实体
  */
 func (s *OAuthService) GetUserInfo(token string) (*model.User, error) {
-	user, _, err := s.ValidateAccessToken(token)
+	user, _, err := s.GetUserInfoWithScope(token)
 	return user, err
 }
 
@@ -902,14 +1120,25 @@ func ParseScope(scope string) []string {
 	return strings.Split(scope, " ")
 }
 
-/*
+/**
  * IntrospectToken Token 内省 (RFC 7662)
- * 功能：校验令牌有效性并返回其元数据，支持 access_token 和 refresh_token
- * @param token         - 待内省的令牌
- * @param clientID      - 请求客户端 ID（可选，用于身份验证）
- * @param clientSecret  - 请求客户端密钥（可选）
- * @param tokenTypeHint - 令牌类型提示
- * @return map[string]interface{} - 令牌元数据（active, scope, sub 等）
+ *
+ * @description
+ *   校验令牌有效性并返回其元数据，支持 access_token 和 refresh_token。
+ *
+ *   安全加固：
+ *   - L-24：secret 比较改用 ConstantTimeCompare 防止时序侧信道
+ *   - H-3：public 客户端不再无凭据通过；至少要求 token 必须归属调用方 client_id
+ *          （防止任意 public app 探测他人 token 元数据）
+ *   - 当调用方不是 token 所属 client 时，返回 minimal info（active+exp），不暴露 user 字段
+ *
+ * @param  {string} token         - 待内省的令牌
+ * @param  {string} clientID      - 请求客户端 ID（必填）
+ * @param  {string} clientSecret  - 请求客户端密钥（confidential/machine 必填）
+ * @param  {string} tokenTypeHint - "access_token" 或 "refresh_token"
+ * @returns {(map[string]interface{}, error)} 令牌元数据
+ * @throws  {ErrInvalidClient} 客户端鉴权失败
+ * @security 跨 client 探测仅返回最少信息
  */
 func (s *OAuthService) IntrospectToken(token, clientID, clientSecret, tokenTypeHint string) (map[string]interface{}, error) {
 	/*
@@ -924,19 +1153,41 @@ func (s *OAuthService) IntrospectToken(token, clientID, clientSecret, tokenTypeH
 	if err != nil {
 		return nil, ErrInvalidClient
 	}
-	/* 机密客户端必须提供有效 secret */
+	/*
+	 * L-24 修复：所有 secret 比较改用 ConstantTimeCompare 防时序侧信道
+	 * H-3 修复：public 应用即便不提供 secret 也通过 — 改为：
+	 *   - confidential/machine：必须 secret
+	 *   - public：必须 secret 或 token 归属本 client（下方再校验）
+	 */
 	if app.AppType == model.AppTypeConfidential || app.AppType == model.AppTypeMachine {
-		if clientSecret == "" || app.ClientSecret != clientSecret {
+		if clientSecret == "" || subtle.ConstantTimeCompare([]byte(app.ClientSecret), []byte(clientSecret)) != 1 {
 			return nil, ErrInvalidClient
 		}
-	} else if clientSecret != "" && app.ClientSecret != clientSecret {
-		return nil, ErrInvalidClient
+	} else if clientSecret != "" {
+		if subtle.ConstantTimeCompare([]byte(app.ClientSecret), []byte(clientSecret)) != 1 {
+			return nil, ErrInvalidClient
+		}
+	}
+
+	/**
+	 * minimalActive 跨 client 探测时返回的最小响应（仅证实 token 是否活跃）
+	 * @returns {map[string]interface{}}
+	 */
+	minimalActive := func(expUnix int64) map[string]interface{} {
+		return map[string]interface{}{
+			"active": true,
+			"exp":    expUnix,
+		}
 	}
 
 	// 尝试验证为access_token
 	if tokenTypeHint == "" || tokenTypeHint == "access_token" {
 		user, accessToken, err := s.ValidateAccessToken(token)
 		if err == nil && accessToken != nil {
+			/* H-3 跨 client 保护：调用方不是 token 所属 client 时只返回最小信息 */
+			if accessToken.ClientID != clientID {
+				return minimalActive(accessToken.ExpiresAt.Unix()), nil
+			}
 			result := map[string]interface{}{
 				"active":     true,
 				"scope":      accessToken.Scope,
@@ -967,7 +1218,11 @@ func (s *OAuthService) IntrospectToken(token, clientID, clientSecret, tokenTypeH
 			if refreshToken.AccessTokenID != nil {
 				accessToken, _ = s.oauthRepo.FindAccessTokenByID(*refreshToken.AccessTokenID)
 			}
-			if accessToken != nil && accessToken.UserID != nil {
+			if accessToken != nil && accessToken.HasEndUser() {
+				/* H-3 跨 client 保护 */
+				if accessToken.ClientID != clientID {
+					return minimalActive(refreshToken.ExpiresAt.Unix()), nil
+				}
 				user, _ := s.userRepo.FindByID(*accessToken.UserID)
 				return map[string]interface{}{
 					"active":     true,
@@ -983,5 +1238,6 @@ func (s *OAuthService) IntrospectToken(token, clientID, clientSecret, tokenTypeH
 		}
 	}
 
-	return nil, errors.New("token not found or invalid")
+	/* 未找到或无效：RFC 7662 §2.2 要求返回 active=false 而非 4xx */
+	return map[string]interface{}{"active": false}, nil
 }

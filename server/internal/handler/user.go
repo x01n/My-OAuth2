@@ -220,6 +220,16 @@ func (h *UserHandler) UpdateProfile(c *gin.Context) {
 		})
 	}
 
+	EmitAuthEvent(AuthEvent{
+		Type:      "user_updated",
+		AppID:     "",
+		AppName:   "System",
+		UserID:    user.ID.String(),
+		Username:  user.Username,
+		Email:     user.Email,
+		Timestamp: time.Now(),
+	})
+
 	Success(c, buildFullUserResponse(user))
 }
 
@@ -313,28 +323,9 @@ func (h *UserHandler) GetAuthorizations(c *gin.Context) {
 		return
 	}
 
-	// Convert to response format
-	var result []map[string]interface{}
-	for _, auth := range auths {
-		item := map[string]interface{}{
-			"id":            auth.ID.String(),
-			"app_id":        auth.AppID.String(),
-			"scope":         auth.Scope,
-			"grant_type":    auth.GrantType,
-			"authorized_at": auth.AuthorizedAt.Format("2006-01-02T15:04:05Z"),
-			"revoked":       auth.Revoked,
-		}
-		if auth.App.ID.String() != "00000000-0000-0000-0000-000000000000" {
-			item["app"] = map[string]interface{}{
-				"id":          auth.App.ID.String(),
-				"name":        auth.App.Name,
-				"description": auth.App.Description,
-			}
-		}
-		if auth.RevokedAt != nil {
-			item["revoked_at"] = auth.RevokedAt.Format("2006-01-02T15:04:05Z")
-		}
-		result = append(result, item)
+	result := make([]AuthorizationResponse, len(auths))
+	for i, auth := range auths {
+		result[i] = toAuthorizationResponse(auth)
 	}
 
 	Success(c, gin.H{"authorizations": result})
@@ -382,6 +373,26 @@ func (h *UserHandler) RevokeAuthorization(c *gin.Context) {
 			}
 		}
 	}
+
+	appName := ""
+	if h.appRepo != nil {
+		if app, appErr := h.appRepo.FindByID(auth.AppID); appErr == nil {
+			appName = app.Name
+		}
+	}
+	username, _ := ctx.GetUserUsername(c)
+	email, _ := ctx.GetUserEmail(c)
+
+	EmitAuthEvent(AuthEvent{
+		Type:      "oauth_revoked",
+		AppID:     auth.AppID.String(),
+		AppName:   appName,
+		UserID:    userID.String(),
+		Username:  username,
+		Email:     email,
+		Scope:     auth.Scope,
+		Timestamp: time.Now(),
+	})
 
 	// Trigger webhook for oauth.revoked
 	if h.webhookService != nil {

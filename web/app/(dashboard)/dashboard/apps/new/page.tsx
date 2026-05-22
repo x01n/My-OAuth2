@@ -1,9 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { api } from '@/lib/api';
+import { useAuth } from '@/lib/auth-context';
 import { useI18n } from '@/lib/i18n';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -13,6 +14,7 @@ import { ArrowLeft, Loader2, Plus, X } from 'lucide-react';
 
 export default function NewAppPage() {
   const router = useRouter();
+  const { user, isLoading: authLoading } = useAuth();
   const { t } = useI18n();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -20,6 +22,14 @@ export default function NewAppPage() {
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [grantTypes, setGrantTypes] = useState<string[]>(['authorization_code', 'refresh_token']);
+  const [scopes, setScopes] = useState('openid profile email phone address');
+  const [allowedScopes, setAllowedScopes] = useState('api.read api.write');
+
+  useEffect(() => {
+    if (!authLoading && user?.role !== 'admin') {
+      router.replace('/dashboard');
+    }
+  }, [authLoading, user?.role, router]);
 
   const handleAddUri = () => {
     setRedirectUris([...redirectUris, '']);
@@ -49,10 +59,15 @@ export default function NewAppPage() {
 
     setIsLoading(true);
 
+    const scopeList = scopes.split(/\s+/).map((s) => s.trim()).filter(Boolean);
+    const allowedList = allowedScopes.split(/\s+/).map((s) => s.trim()).filter(Boolean);
+
     const response = await api.createApp({
       name,
       description,
       redirect_uris: validUris,
+      scopes: scopeList,
+      allowed_scopes: allowedList,
       grant_types: grantTypes,
     });
 
@@ -166,6 +181,32 @@ export default function NewAppPage() {
                   {t('common.add')}
                 </Button>
               </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="scopes">{t('apps.create.scopes')}</Label>
+              <p className="text-sm text-muted-foreground">{t('apps.create.scopesHelp')}</p>
+              <Input
+                id="scopes"
+                placeholder={t('apps.create.scopesPlaceholder')}
+                value={scopes}
+                onChange={(e) => setScopes(e.target.value)}
+                disabled={isLoading}
+                spellCheck={false}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="allowed_scopes">{t('apps.detail.allowedScopes')}</Label>
+              <p className="text-sm text-muted-foreground">{t('apps.detail.allowedScopesDesc')}</p>
+              <Input
+                id="allowed_scopes"
+                placeholder={t('apps.detail.allowedScopesPlaceholder')}
+                value={allowedScopes}
+                onChange={(e) => setAllowedScopes(e.target.value)}
+                disabled={isLoading}
+                spellCheck={false}
+              />
             </div>
 
             <div className="space-y-4">

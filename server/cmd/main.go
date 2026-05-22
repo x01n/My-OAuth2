@@ -208,7 +208,7 @@ func main() {
 
 	// Webhook background retry worker
 	webhookRepo := repository.NewWebhookRepository(database.GetDB())
-	webhookSvc := service.NewWebhookService(webhookRepo)
+	webhookSvc := service.NewWebhookService(webhookRepo, cfg.Server.Mode == "debug")
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)

@@ -64,9 +64,57 @@ func (r *OAuthRepository) FindAuthorizationCode(code string) (*model.Authorizati
 	return &authCode, nil
 }
 
-/* MarkAuthorizationCodeUsed 标记授权码为已使用 */
-func (r *OAuthRepository) MarkAuthorizationCodeUsed(code string) error {
-	return r.db.Model(&model.AuthorizationCode{}).Where("code = ?", code).Update("used", true).Error
+/*
+ * FindReusableAuthorizationCode 查找同一授权请求下仍可用的授权码（防重复提交）
+ */
+func (r *OAuthRepository) FindReusableAuthorizationCode(
+	userID uuid.UUID,
+	clientID, redirectURI, scope, codeChallenge string,
+) (*model.AuthorizationCode, error) {
+	var authCode model.AuthorizationCode
+	q := r.db.Where(
+		"user_id = ? AND client_id = ? AND redirect_uri = ? AND scope = ? AND used = ? AND expires_at > ?",
+		userID, clientID, redirectURI, scope, false, time.Now(),
+	)
+	if codeChallenge != "" {
+		q = q.Where("code_challenge = ?", codeChallenge)
+	} else {
+		q = q.Where("(code_challenge = '' OR code_challenge IS NULL)")
+	}
+	err := q.Order("created_at DESC").First(&authCode).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrAuthCodeNotFound
+		}
+		return nil, err
+	}
+	if !authCode.IsValid() {
+		return nil, ErrAuthCodeNotFound
+	}
+	return &authCode, nil
+}
+
+/**
+ * MarkAuthorizationCodeUsed 原子地把授权码标记为已使用
+ *
+ * @description
+ *   RFC 6749 §4.1.2 要求 code 单次使用。使用条件 UPDATE：
+ *   `UPDATE ... SET used=true WHERE code=? AND used=false`，
+ *   仅当 RowsAffected==1 时调用方拿到所有权可继续签发 token，
+ *   否则代表本次请求并发输给了另一个兑换请求，必须拒绝。
+ *
+ * @param  {string} code - 授权码
+ * @returns {(bool, error)} (claimed, err) — claimed=true 表示本次抢占成功
+ * @security L-4 修复：单条原子 SQL 防止并发兑换签发多对 token
+ */
+func (r *OAuthRepository) MarkAuthorizationCodeUsed(code string) (bool, error) {
+	res := r.db.Model(&model.AuthorizationCode{}).
+		Where("code = ? AND used = ?", code, false).
+		Update("used", true)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
 }
 
 /* DeleteExpiredAuthorizationCodes 清理已过期的授权码 */
@@ -153,9 +201,26 @@ func (r *OAuthRepository) FindRefreshToken(token string) (*model.RefreshToken, e
 	return &refreshToken, nil
 }
 
-/* RevokeRefreshToken 撤销刷新令牌 */
-func (r *OAuthRepository) RevokeRefreshToken(token string) error {
-	return r.db.Model(&model.RefreshToken{}).Where("token = ?", token).Update("revoked", true).Error
+/**
+ * RevokeRefreshToken 原子撤销刷新令牌
+ *
+ * @description
+ *   条件 UPDATE 抢占语义：`UPDATE ... SET revoked=true WHERE token=? AND revoked=false`，
+ *   RowsAffected==1 才代表本次撤销由本调用产生。OAuth2 流程的 refresh token rotation
+ *   需根据该返回值决定是否签发新 token（L-9 修复并发问题）。
+ *
+ * @param  {string} token - refresh_token 字符串
+ * @returns {(bool, error)} (claimed, err) — claimed=true 表示本次抢占成功
+ * @security L-9 修复：并发刷新只允许一个成功
+ */
+func (r *OAuthRepository) RevokeRefreshToken(token string) (bool, error) {
+	res := r.db.Model(&model.RefreshToken{}).
+		Where("token = ? AND revoked = ?", token, false).
+		Update("revoked", true)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
 }
 
 /* RevokeRefreshTokenByAccessTokenID 根据关联的 access_token_id 撤销刷新令牌 */
@@ -193,19 +258,51 @@ func (r *OAuthRepository) DeleteExpiredTokens() error {
 	return r.db.Delete(&model.RefreshToken{}, "expires_at < ?", now).Error
 }
 
+/**
+ * DeleteTokensByClientID 删除指定 client_id 的 OAuth 凭证数据
+ *
+ * @description
+ *   删除顺序：authorization_codes → refresh_tokens → access_tokens，
+ *   其中 refresh_tokens 通过 access_tokens 子查询关联删除，避免应用删除后残留授权数据。
+ *
+ * @param  {string} clientID - OAuth 应用 client_id
+ * @returns {error}
+ */
+func (r *OAuthRepository) DeleteTokensByClientID(clientID string) error {
+	if err := r.db.Delete(&model.AuthorizationCode{}, "client_id = ?", clientID).Error; err != nil {
+		return err
+	}
+	if err := r.db.Exec(`
+		DELETE FROM refresh_tokens
+		WHERE access_token_id IN (
+			SELECT id FROM access_tokens WHERE client_id = ?
+		)`, clientID).Error; err != nil {
+		return err
+	}
+	return r.db.Delete(&model.AccessToken{}, "client_id = ?", clientID).Error
+}
+
 /*
  * RevokeTokensByUserID 撤销用户的所有令牌（用于登出）
  * @param userID - 用户 UUID
  */
 func (r *OAuthRepository) RevokeTokensByUserID(userID uuid.UUID) error {
+	var accessIDs []uuid.UUID
+	if err := r.db.Model(&model.AccessToken{}).Where("user_id = ?", userID).Pluck("id", &accessIDs).Error; err != nil {
+		return err
+	}
 	if err := r.db.Model(&model.AccessToken{}).Where("user_id = ?", userID).Update("revoked", true).Error; err != nil {
 		return err
+	}
+	if len(accessIDs) > 0 {
+		if err := r.db.Model(&model.RefreshToken{}).Where("access_token_id IN ?", accessIDs).Update("revoked", true).Error; err != nil {
+			return err
+		}
 	}
 	return r.db.Model(&model.RefreshToken{}).Where("user_id = ?", userID).Update("revoked", true).Error
 }
 
 /*
- * === Auth Refresh Token Rotation ===
  * 以下方法用于用户认证系统的 refresh token 轮换（单次使用）
  * 使用 JWT 的 jti（Token 字段）作为唯一标识
  */

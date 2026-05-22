@@ -110,8 +110,8 @@ function CreateUserDialog({ onClose, onSuccess }: { onClose: () => void; onSucce
               </div>
               <div className="space-y-2">
                 <Label>{t('admin.users.statusLabel')}</Label>
-                <select className="w-full h-10 px-3 rounded-md border border-input bg-background" value={form.status} onChange={e => setForm(p => ({ ...p, status: e.target.value as 'active' | 'suspended' | 'pending' }))}>
-                  <option value="active">{t('admin.users.active')}</option><option value="suspended">{t('admin.users.suspended')}</option><option value="pending">{t('admin.users.pending')}</option>
+                <select className="w-full h-10 px-3 rounded-md border border-input bg-background" value={form.status} onChange={e => setForm(p => ({ ...p, status: e.target.value as 'active' | 'disabled' | 'suspended' | 'pending' }))}>
+                  <option value="active">{t('admin.users.active')}</option><option value="disabled">disabled</option><option value="suspended">{t('admin.users.suspended')}</option><option value="pending">{t('admin.users.pending')}</option>
                 </select>
               </div>
             </div>
@@ -186,8 +186,8 @@ function EditUserDialog({ userData, onClose, onSuccess }: { userData: User; onCl
             </div>
             <div className="space-y-2">
               <Label>{t('admin.users.statusLabel')}</Label>
-              <select className="w-full h-10 px-3 rounded-md border border-input bg-background" value={form.status} onChange={e => setForm(p => ({ ...p, status: e.target.value as 'active' | 'suspended' | 'pending' }))}>
-                <option value="active">{t('admin.users.active')}</option><option value="suspended">{t('admin.users.suspended')}</option><option value="pending">{t('admin.users.pending')}</option>
+              <select className="w-full h-10 px-3 rounded-md border border-input bg-background" value={form.status} onChange={e => setForm(p => ({ ...p, status: e.target.value as 'active' | 'disabled' | 'suspended' | 'pending' }))}>
+                <option value="active">{t('admin.users.active')}</option><option value="disabled">disabled</option><option value="suspended">{t('admin.users.suspended')}</option><option value="pending">{t('admin.users.pending')}</option>
               </select>
             </div>
           </div>
@@ -342,7 +342,7 @@ export default function AdminPage() {
     setUpdatingUserId(null); setActionMenuUser(null);
   };
 
-  const handleStatusChange = async (userId: string, newStatus: 'active' | 'suspended') => {
+  const handleStatusChange = async (userId: string, newStatus: 'active' | 'disabled' | 'suspended') => {
     setUpdatingUserId(userId);
     const response = await api.updateUserStatus(userId, newStatus);
     if (response.success) { setUsers(users.map(u => u.id === userId ? { ...u, status: newStatus } : u)); }
@@ -360,6 +360,7 @@ export default function AdminPage() {
     const userIds = Array.from(selectedUsers);
     if (userIds.length === 0) return;
     if (action === 'delete') { if (!confirm(t('admin.users.batchConfirmDelete', { count: String(userIds.length) }))) return; await api.batchDeleteUsers(userIds); }
+    else if (action === 'disable') { await api.batchUpdateUserStatus(userIds, 'disabled'); }
     else if (action === 'suspend') { await api.batchUpdateUserStatus(userIds, 'suspended'); }
     else if (action === 'activate') { await api.batchUpdateUserStatus(userIds, 'active'); }
     setSelectedUsers(new Set()); await loadUsers(); loadStats();
@@ -458,6 +459,7 @@ export default function AdminPage() {
             >
               <option value="">{t('admin.users.allStatus')}</option>
               <option value="active">{t('admin.users.active')}</option>
+              <option value="disabled">disabled</option>
               <option value="suspended">{t('admin.users.suspended')}</option>
               <option value="pending">{t('admin.users.pending')}</option>
             </select>
@@ -478,6 +480,9 @@ export default function AdminPage() {
               <div className="flex gap-2 ml-auto">
                 <Button variant="outline" size="sm" onClick={() => handleBatchAction('activate')}>
                   <UserCheck className="h-4 w-4 mr-1" />{t('admin.users.batchActivate')}
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => handleBatchAction('disable')}>
+                  <Ban className="h-4 w-4 mr-1" />{t('admin.users.disableAccount')}
                 </Button>
                 <Button variant="outline" size="sm" onClick={() => handleBatchAction('suspend')}>
                   <Ban className="h-4 w-4 mr-1" />{t('admin.users.batchSuspend')}
@@ -566,10 +571,10 @@ export default function AdminPage() {
                         <td className="p-3">
                           <div className="flex gap-1 flex-wrap">
                             <Badge
-                              variant={u.status === 'suspended' ? 'destructive' : u.status === 'pending' ? 'outline' : 'secondary'}
+                              variant={u.status === 'disabled' || u.status === 'suspended' ? 'destructive' : u.status === 'pending' ? 'outline' : 'secondary'}
                               className="text-xs"
                             >
-                              {u.status === 'suspended' ? t('admin.users.suspended') : u.status === 'pending' ? t('admin.users.pending') : t('admin.users.active')}
+                              {u.status === 'disabled' ? 'disabled' : u.status === 'suspended' ? t('admin.users.suspended') : u.status === 'pending' ? t('admin.users.pending') : t('admin.users.active')}
                             </Badge>
                             {u.locked_until && new Date(u.locked_until) > new Date() && (
                               <Badge variant="destructive" className="text-xs">
@@ -634,7 +639,7 @@ export default function AdminPage() {
                                 {u.status === 'active' ? (
                                   <button
                                     className="w-full px-4 py-2 text-left text-sm hover:bg-muted/50 flex items-center gap-2 text-orange-500"
-                                    onClick={() => handleStatusChange(u.id, 'suspended')}
+                                    onClick={() => handleStatusChange(u.id, 'disabled')}
                                   >
                                     <Ban className="h-4 w-4" />{t('admin.users.disableAccount')}
                                   </button>

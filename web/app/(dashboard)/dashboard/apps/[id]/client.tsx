@@ -9,9 +9,9 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { ArrowLeft, Copy, Check, Loader2, Eye, EyeOff, AlertTriangle, RefreshCw, Save, Plus, X, Pencil } from 'lucide-react';
+import { ArrowLeft, Copy, Check, Loader2, Eye, EyeOff, AlertTriangle, RefreshCw, Save, Plus, X, Pencil, Users } from 'lucide-react';
 import { WebhookManager } from '@/components/webhook-manager';
-import type { Application } from '@/lib/types';
+import type { Application, AuthUserSummary, UserAuthorization } from '@/lib/types';
 
 function AppDetailContent() {
   const params = useParams();
@@ -35,13 +35,22 @@ function AppDetailContent() {
     }
   }, [params.id]);
   const [stats, setStats] = useState<{ total_authorizations: number; active_tokens: number; total_users: number; last_24h_tokens: number } | null>(null);
+  const [authorizedUsers, setAuthorizedUsers] = useState<UserAuthorization[]>([]);
+  const [authorizedUsersTotal, setAuthorizedUsersTotal] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [showSecret, setShowSecret] = useState(isNew);
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [isResetting, setIsResetting] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [editForm, setEditForm] = useState({ name: '', description: '', redirect_uris: [''], grant_types: ['authorization_code', 'refresh_token'] });
+  const [editForm, setEditForm] = useState({
+    name: '',
+    description: '',
+    redirect_uris: [''],
+    scopes: 'openid profile email phone address',
+    allowed_scopes: 'api.read api.write',
+    grant_types: ['authorization_code', 'refresh_token'],
+  });
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const loadApp = useCallback(async () => {
@@ -59,6 +68,12 @@ function AppDetailContent() {
       const statsResponse = await api.getAppStats(appId);
       if (statsResponse.success && statsResponse.data) {
         setStats(statsResponse.data);
+      }
+
+      const usersResponse = await api.getAppAuthorizedUsers(appId, 1, 50);
+      if (usersResponse.success && usersResponse.data) {
+        setAuthorizedUsers(usersResponse.data.authorizations || []);
+        setAuthorizedUsersTotal(usersResponse.data.total || 0);
       }
     }
     setIsLoading(false);
@@ -98,6 +113,8 @@ function AppDetailContent() {
       name: app.name,
       description: app.description || '',
       redirect_uris: app.redirect_uris.length > 0 ? [...app.redirect_uris] : [''],
+      scopes: Array.isArray(app.scopes) && app.scopes.length > 0 ? app.scopes.join(' ') : 'openid profile email phone address',
+      allowed_scopes: Array.isArray(app.allowed_scopes) && app.allowed_scopes.length > 0 ? app.allowed_scopes.join(' ') : 'api.read api.write',
       grant_types: Array.isArray(app.grant_types) && app.grant_types.length > 0 ? [...app.grant_types] : ['authorization_code', 'refresh_token'],
     });
     setIsEditing(true);
@@ -105,7 +122,14 @@ function AppDetailContent() {
 
   const cancelEditing = () => {
     setIsEditing(false);
-    setEditForm({ name: '', description: '', redirect_uris: [''], grant_types: ['authorization_code', 'refresh_token'] });
+    setEditForm({
+      name: '',
+      description: '',
+      redirect_uris: [''],
+      scopes: 'openid profile email phone address',
+      allowed_scopes: 'api.read api.write',
+      grant_types: ['authorization_code', 'refresh_token'],
+    });
   };
 
   const handleAddUri = () => {
@@ -136,11 +160,16 @@ function AppDetailContent() {
       return;
     }
 
+    const scopeList = editForm.scopes.split(/\s+/).map((s) => s.trim()).filter(Boolean);
+    const allowedList = editForm.allowed_scopes.split(/\s+/).map((s) => s.trim()).filter(Boolean);
+
     setIsSaving(true);
     const response = await api.updateApp(app.id, {
       name: editForm.name,
       description: editForm.description,
       redirect_uris: validUris,
+      scopes: scopeList,
+      allowed_scopes: allowedList,
       grant_types: editForm.grant_types,
     });
 
@@ -263,6 +292,86 @@ function AppDetailContent() {
         </div>
       )}
 
+      {/* Authorized Users */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Users className="h-5 w-5" />
+            {t('apps.detail.authorizedUsersList')}
+          </CardTitle>
+          <CardDescription>
+            {t('apps.detail.authorizedUsersDesc')}
+            {authorizedUsersTotal > 0 && (
+              <span className="ml-1 text-foreground">({authorizedUsersTotal})</span>
+            )}
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {authorizedUsers.length === 0 ? (
+            <p className="text-sm text-muted-foreground">{t('apps.detail.noAuthorizedUsers')}</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b text-left text-muted-foreground">
+                    <th className="pb-2 pr-4 font-medium">{t('apps.detail.colUser')}</th>
+                    <th className="pb-2 pr-4 font-medium">{t('apps.detail.colScope')}</th>
+                    <th className="pb-2 pr-4 font-medium">{t('apps.detail.colGrantType')}</th>
+                    <th className="pb-2 pr-4 font-medium">{t('apps.detail.colStatus')}</th>
+                    <th className="pb-2 font-medium">{t('apps.detail.colAuthorizedAt')}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {authorizedUsers.map((auth) => {
+                    const u = auth.user as AuthUserSummary | undefined;
+                    const displayName = u?.display_name || u?.username || u?.email || auth.user_id.slice(0, 8);
+                    const scopes = auth.scopes?.length ? auth.scopes : auth.scope?.split(' ').filter(Boolean);
+                    return (
+                      <tr key={auth.id} className="border-b last:border-0 align-top">
+                        <td className="py-3 pr-4">
+                          <div className="font-medium">{displayName}</div>
+                          {u?.email && (
+                            <div className="text-xs text-muted-foreground">{u.email}</div>
+                          )}
+                          {u?.username && u.email !== u.username && (
+                            <div className="text-xs text-muted-foreground font-mono">@{u.username}</div>
+                          )}
+                        </td>
+                        <td className="py-3 pr-4">
+                          <div className="flex flex-wrap gap-1 max-w-xs">
+                            {(scopes || []).map((s) => (
+                              <span key={s} className="px-1.5 py-0.5 rounded bg-muted text-xs font-mono">{s}</span>
+                            ))}
+                            {(!scopes || scopes.length === 0) && (
+                              <span className="text-muted-foreground text-xs">—</span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="py-3 pr-4 font-mono text-xs">{auth.grant_type || '—'}</td>
+                        <td className="py-3 pr-4">
+                          <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${
+                            auth.is_active ?? !auth.revoked
+                              ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+                              : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
+                          }`}>
+                            {(auth.is_active ?? !auth.revoked)
+                              ? t('apps.detail.authStatusActive')
+                              : t('apps.detail.authStatusRevoked')}
+                          </span>
+                        </td>
+                        <td className="py-3 text-muted-foreground whitespace-nowrap">
+                          {new Date(auth.authorized_at).toLocaleString(dateLocale)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       {/* Credentials */}
       <Card>
         <CardHeader>
@@ -360,6 +469,94 @@ function AppDetailContent() {
               )}
             </div>
           )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>{t('apps.detail.scopes')}</CardTitle>
+          <CardDescription>{t('apps.detail.scopesDesc')}</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {isEditing ? (
+            <>
+              <div className="space-y-2">
+                <Label className="text-xs text-muted-foreground">{t('apps.detail.scopes')}</Label>
+                <Input
+                  value={editForm.scopes}
+                  onChange={(e) => setEditForm({ ...editForm, scopes: e.target.value })}
+                  placeholder={t('apps.detail.scopesPlaceholder')}
+                  className="font-mono text-sm"
+                  spellCheck={false}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs text-muted-foreground">{t('apps.detail.allowedScopes')}</Label>
+                <Input
+                  value={editForm.allowed_scopes}
+                  onChange={(e) => setEditForm({ ...editForm, allowed_scopes: e.target.value })}
+                  placeholder={t('apps.detail.allowedScopesPlaceholder')}
+                  className="font-mono text-sm"
+                  spellCheck={false}
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <div>
+                <p className="text-xs text-muted-foreground mb-2">{t('apps.detail.scopes')}</p>
+                <div className="flex flex-wrap gap-2">
+                  {(app.scopes || []).map((s) => (
+                    <span key={s} className="px-2 py-1 rounded border text-xs font-mono bg-primary/5">
+                      {s}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              {(app.allowed_scopes || []).length > 0 && (
+                <div>
+                  <p className="text-xs text-muted-foreground mb-2">{t('apps.detail.allowedScopes')}</p>
+                  <div className="flex flex-wrap gap-2">
+                    {app.allowed_scopes!.map((s) => (
+                      <span key={s} className="px-2 py-1 rounded border text-xs font-mono">
+                        {s}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>{t('apps.detail.oauthMetadata')}</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-2 text-sm">
+          <div className="flex justify-between gap-4">
+            <span className="text-muted-foreground">{t('apps.detail.appType')}</span>
+            <span className="font-mono">{app.app_type || 'confidential'}</span>
+          </div>
+          <div className="flex justify-between gap-4">
+            <span className="text-muted-foreground">{t('apps.detail.tokenEndpointAuthMethod')}</span>
+            <span className="font-mono text-right">{app.token_endpoint_auth_method || 'client_secret_basic'}</span>
+          </div>
+          <div className="flex justify-between gap-4">
+            <span className="text-muted-foreground">{t('apps.detail.responseTypes')}</span>
+            <span className="font-mono text-right">{(app.response_types_supported || ['code']).join(' ')}</span>
+          </div>
+          <div>
+            <p className="text-xs text-muted-foreground mb-2">{t('apps.detail.issuedTokenTypes')}</p>
+            <div className="flex flex-wrap gap-2">
+              {(app.issued_token_types || ['access_token', 'refresh_token', 'id_token']).map((tok) => (
+                <span key={tok} className="px-2 py-1 rounded bg-primary/10 border text-xs font-mono">
+                  {tok}
+                </span>
+              ))}
+            </div>
+          </div>
         </CardContent>
       </Card>
 

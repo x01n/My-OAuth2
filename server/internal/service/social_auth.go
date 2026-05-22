@@ -107,7 +107,14 @@ var builtinProviders = map[string]ProviderConfig{
 	},
 }
 
-// GetAuthURL 获取第三方登录授权URL
+/**
+ * GetAuthURL 获取第三方登录授权 URL
+ *
+ * @param  {string} providerSlug - 提供者标识
+ * @param  {string} state        - CSRF state
+ * @param  {string} redirectURI  - 回调地址
+ * @returns {(string, error)}
+ */
 func (s *SocialAuthService) GetAuthURL(providerSlug, state, redirectURI string) (string, error) {
 	provider, err := s.federationRepo.FindBySlug(providerSlug)
 	if err != nil {
@@ -423,7 +430,21 @@ func (s *SocialAuthService) LoginOrCreateUser(
 	// 尝试通过邮箱查找用户
 	existingUser, err := s.userRepo.FindByEmail(userInfo.Email)
 	if err == nil && existingUser != nil {
-		// 用户存在，创建关联
+		/*
+		 * C-4 / L-7 修复：仅在双向验证通过时才允许自动合并已有账户
+		 *
+		 * 拒绝合并条件（任一）：
+		 *   - provider.TrustEmailVerified == false（管理员未将其标为可信邮箱来源）
+		 *   - userInfo.EmailVerified == false（远端 IdP 未确认邮箱）
+		 *
+		 * 拒绝合并时返回 ErrEmailAlreadyExists，提示用户先登录再手动绑定。
+		 * @security 防止恶意 IdP 注册 admin@victim 后接管本地管理员账号
+		 */
+		if !(provider.TrustEmailVerified && userInfo.EmailVerified) {
+			return nil, nil, errors.New("email already registered; please sign in first and link the provider manually")
+		}
+
+		// 用户存在 + 验证通过，创建关联
 		identity := &model.FederatedIdentity{
 			UserID:        existingUser.ID,
 			ProviderID:    provider.ID,
@@ -573,9 +594,22 @@ func (s *SocialAuthService) generateTokens(user *model.User) (*AuthTokens, error
 		}
 	}
 
+	loginScope := "openid profile email"
+	idTTL := s.config.OAuth.IDTokenTTL
+	if idTTL <= 0 {
+		idTTL = s.config.JWT.AccessTokenTTL
+	}
+	idToken, err := s.jwtManager.GenerateIDToken(
+		user.ID, user.Email, user.Username, string(user.Role), "", loginScope, idTTL,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &AuthTokens{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
+		IDToken:      idToken,
 		TokenType:    "Bearer",
 		ExpiresIn:    int64(s.config.JWT.AccessTokenTTL.Seconds()),
 	}, nil

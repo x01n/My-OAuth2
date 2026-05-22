@@ -12,12 +12,12 @@ import (
  * 功能：记录用户对应用的 OAuth2 授权状态，包括授权范围、时间和撤销信息
  *       用户可在个人中心查看和撤销已授权的应用
  * 表名：user_authorizations
- * 索引：user_id, app_id
+ * 索引：user_id, app_id，唯一约束：(user_id, app_id)
  */
 type UserAuthorization struct {
 	ID           uuid.UUID  `gorm:"type:uuid;primaryKey" json:"id"`
-	UserID       uuid.UUID  `gorm:"type:uuid;index;not null" json:"user_id"`
-	AppID        uuid.UUID  `gorm:"type:uuid;index;not null" json:"app_id"`
+	UserID       uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex:idx_user_app_auth,priority:1" json:"user_id"`
+	AppID        uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex:idx_user_app_auth,priority:2" json:"app_id"`
 	Scope        string     `gorm:"size:500" json:"scope"`
 	GrantType    string     `gorm:"size:50;default:'authorization_code'" json:"grant_type"`
 	AuthorizedAt time.Time  `gorm:"not null" json:"authorized_at"`

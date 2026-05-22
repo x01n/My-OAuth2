@@ -14,6 +14,8 @@ import (
 /* ClientCredentialsRequest Client Credentials 授权请求参数 */
 type ClientCredentialsRequest struct {
 	Scope string // Optional: space-separated list of scopes
+	/* StoreInSession 为 true 时写入全局 tokenStore（默认 false，避免污染用户授权码会话） */
+	StoreInSession bool
 }
 
 /* ClientCredentialsResponse Client Credentials 授权响应结构 */
@@ -81,14 +83,16 @@ func (c *Client) ClientCredentials(ctx context.Context, req *ClientCredentialsRe
 		return nil, fmt.Errorf("oauth2: failed to parse response: %w", err)
 	}
 
-	// Store the token for later use
-	token := &Token{
-		AccessToken: result.AccessToken,
-		TokenType:   result.TokenType,
-	}
-	token.SetExpiry(result.ExpiresIn)
-	if err := c.tokenStore.SetToken(token); err != nil {
-		c.logger.Warn("Failed to store client credentials token", "error", err)
+	if req.StoreInSession {
+		token := &Token{
+			AccessToken: result.AccessToken,
+			TokenType:   result.TokenType,
+			Scope:       result.Scope,
+		}
+		token.SetExpiry(result.ExpiresIn)
+		if err := c.tokenStore.SetToken(token); err != nil {
+			c.logger.Warn("Failed to store client credentials token", "error", err)
+		}
 	}
 
 	c.logger.Info("Client credentials flow completed successfully")

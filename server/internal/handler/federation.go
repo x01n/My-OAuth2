@@ -494,6 +494,24 @@ func (h *FederationHandler) fetchUserInfo(provider *model.FederatedProvider, acc
 	return &userInfo, nil
 }
 
+/**
+ * findOrCreateUser 根据联邦身份查找或创建本地用户
+ *
+ * @description
+ *   流程：
+ *   1. 已有 FederatedIdentity → 复用关联用户（更新 token + 同步 profile）
+ *   2. 该 sub 没有绑定 → 按 email 查本地用户：
+ *      - C-4 安全修复：**只有当 provider.TrustEmailVerified==true 且 userInfo.EmailVerified==true
+ *        时才允许自动合并**。否则拒绝自动合并（防止恶意 IdP 注册 admin@victim 接管管理员）。
+ *   3. 无现有用户 → 按 provider.AutoCreateUser 决定是否新建
+ *
+ * @param  {*model.FederatedProvider} provider
+ * @param  {*userInfoResponse}        userInfo
+ * @param  {*tokenResponse}           tokenResp
+ * @returns {(*model.User, error)}
+ * @throws  {error} 当邮箱已存在但未通过双向验证 → 阻止自动合并
+ * @security C-4 修复：未验证邮箱不允许自动合并已有账户
+ */
 func (h *FederationHandler) findOrCreateUser(provider *model.FederatedProvider, userInfo *userInfoResponse, tokenResp *tokenResponse) (*model.User, error) {
 	// 先查找已关联的身份
 	identity, err := h.providerRepo.FindIdentityByExternalID(provider.ID, userInfo.Sub)
@@ -531,6 +549,20 @@ func (h *FederationHandler) findOrCreateUser(provider *model.FederatedProvider, 
 		}
 		if err := h.userRepo.Create(user); err != nil {
 			return nil, err
+		}
+	} else {
+		/*
+		 * C-4 修复（关键安全分支）：
+		 * 本地已存在该邮箱用户 → 必须双向验证后才能自动合并。
+		 *
+		 * 拒绝合并条件（任一）：
+		 *   - provider 未被管理员标记为可信邮箱来源（TrustEmailVerified=false）
+		 *   - 远端 userInfo 没有标记邮箱已验证（防止恶意 IdP 伪造）
+		 *
+		 * 拒绝时不抛具体原因（防止用户枚举），让用户先登录本地账号再手动绑定。
+		 */
+		if !(provider.TrustEmailVerified && userInfo.EmailVerified) {
+			return nil, fmt.Errorf("email already registered; please sign in first and link the provider manually")
 		}
 	}
 

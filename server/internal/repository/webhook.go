@@ -92,14 +92,30 @@ func (r *WebhookRepository) Update(webhook *model.Webhook) error {
 	return r.db.Save(webhook).Error
 }
 
-/* Delete 删除 Webhook */
+/* Delete 删除 Webhook（先删除关联投递记录，避免外键约束失败） */
 func (r *WebhookRepository) Delete(id uuid.UUID) error {
-	return r.db.Delete(&model.Webhook{}, "id = ?", id).Error
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("webhook_id = ?", id).Delete(&model.WebhookDelivery{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&model.Webhook{}, "id = ?", id).Error
+	})
 }
 
-/* DeleteByAppID 删除应用的所有 Webhook */
+/* DeleteByAppID 删除应用的所有 Webhook（含投递记录） */
 func (r *WebhookRepository) DeleteByAppID(appID uuid.UUID) error {
-	return r.db.Delete(&model.Webhook{}, "app_id = ?", appID).Error
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var webhookIDs []uuid.UUID
+		if err := tx.Model(&model.Webhook{}).Where("app_id = ?", appID).Pluck("id", &webhookIDs).Error; err != nil {
+			return err
+		}
+		if len(webhookIDs) > 0 {
+			if err := tx.Where("webhook_id IN ?", webhookIDs).Delete(&model.WebhookDelivery{}).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Delete(&model.Webhook{}, "app_id = ?", appID).Error
+	})
 }
 
 /* CreateDelivery 创建 Webhook 投递记录 */

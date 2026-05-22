@@ -96,6 +96,11 @@ func (r *EmailVerificationRepository) DeleteExpired() error {
 	return r.db.Where("expires_at < ?", time.Now()).Delete(&model.EmailVerification{}).Error
 }
 
+/* DeleteByUserID 删除用户的所有邮箱验证记录 */
+func (r *EmailVerificationRepository) DeleteByUserID(userID uuid.UUID) error {
+	return r.db.Delete(&model.EmailVerification{}, "user_id = ?", userID).Error
+}
+
 /*
  * CountRecentByUserID 统计用户在指定时间内的验证请求次数（用于限流）
  * @param userID   - 用户 UUID

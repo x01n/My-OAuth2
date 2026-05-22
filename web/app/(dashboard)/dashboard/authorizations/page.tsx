@@ -125,8 +125,11 @@ export default function AuthorizationsPage() {
                           </span>
                         </div>
                         <p className="text-sm text-muted-foreground">
-                          {auth.scope?.split(' ').join(', ') || t('common.noScope')}
+                          {(auth.scopes?.length ? auth.scopes.join(', ') : auth.scope?.split(' ').join(', ')) || t('common.noScope')}
                         </p>
+                        {'client_id' in (auth.app || {}) && auth.app?.client_id && (
+                          <p className="text-xs text-muted-foreground font-mono">{auth.app.client_id}</p>
+                        )}
                         <p className="text-xs text-muted-foreground">
                           {t('authorizations.authorizedAt')}: {new Date(auth.authorized_at).toLocaleDateString(dateLocale)}
                         </p>
@@ -189,8 +192,11 @@ export default function AuthorizationsPage() {
                           </span>
                         </div>
                         <p className="text-sm text-muted-foreground">
-                          {auth.scope?.split(' ').join(', ') || t('common.noScope')}
+                          {(auth.scopes?.length ? auth.scopes.join(', ') : auth.scope?.split(' ').join(', ')) || t('common.noScope')}
                         </p>
+                        {'client_id' in (auth.app || {}) && auth.app?.client_id && (
+                          <p className="text-xs text-muted-foreground font-mono">{auth.app.client_id}</p>
+                        )}
                         <p className="text-xs text-muted-foreground">
                           {t('authorizations.revokedAt')}: {auth.revoked_at ? new Date(auth.revoked_at).toLocaleDateString(dateLocale) : '-'}
                         </p>

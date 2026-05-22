@@ -15,10 +15,17 @@ import { useI18n } from '@/lib/i18n'
 interface DeviceInfo {
   user_code: string
   scope: string
+  scopes?: string[]
+  requested_scopes?: string[]
+  issued_token_types?: string[]
+  verification_uri?: string
   app: {
     id: string
+    client_id?: string
     name: string
     description: string
+    scopes?: string[]
+    issued_token_types?: string[]
   }
   expires_in: number
 }
@@ -175,27 +182,45 @@ function DevicePageContent() {
                   <p className="text-sm text-muted-foreground mb-4">{deviceInfo.app.description}</p>
                 )}
                 
-                {deviceInfo.scope && (
-                  <div className="mt-4">
-                    <p className="text-sm font-medium mb-2">{t('device.permissions')}</p>
-                    <div className="flex flex-wrap gap-2">
-                      {deviceInfo.scope.split(' ').map((scope) => (
-                        <span
-                          key={scope}
-                          className="px-2 py-1 bg-primary/10 text-primary text-xs rounded-full"
-                        >
-                          {scope}
-                        </span>
-                      ))}
+                {(() => {
+                  const scopes = deviceInfo.requested_scopes?.length
+                    ? deviceInfo.requested_scopes
+                    : deviceInfo.scopes?.length
+                      ? deviceInfo.scopes
+                      : deviceInfo.scope
+                        ? deviceInfo.scope.split(/\s+/).filter(Boolean)
+                        : []
+                  if (scopes.length === 0) return null
+                  return (
+                    <div className="mt-4">
+                      <p className="text-sm font-medium mb-2">{t('device.permissions')}</p>
+                      <div className="flex flex-wrap gap-2">
+                        {scopes.map((s) => (
+                          <span
+                            key={s}
+                            className="px-2 py-1 bg-primary/10 text-primary text-xs rounded-full"
+                          >
+                            {s}
+                          </span>
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                )}
+                  )
+                })()}
+                {(deviceInfo.issued_token_types?.length || deviceInfo.app.issued_token_types?.length) ? (
+                  <p className="text-xs text-muted-foreground mt-3">
+                    {t('device.tokenTypes')}:{' '}
+                    {(deviceInfo.issued_token_types || deviceInfo.app.issued_token_types || []).join(', ')}
+                  </p>
+                ) : null}
               </div>
 
               {user ? (
                 <div className="space-y-3">
                   <p className="text-sm text-center text-muted-foreground">
-                    {t('device.authorizeAs', { username: user.username })}
+                    {t('device.authorizeAs', {
+                      username: user.username || user.email || user.id,
+                    })}
                   </p>
                   <div className="flex gap-3">
                     <Button

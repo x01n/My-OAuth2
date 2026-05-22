@@ -87,7 +87,11 @@ type UserListItem struct {
 	UpdatedAt        string  `json:"updated_at"`
 }
 
-// ListUsers returns all users (admin only)
+/**
+ * ListUsers 获取用户分页列表（管理员专用）
+ *
+ * @route GET /api/admin/users
+ */
 func (h *AdminHandler) ListUsers(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
@@ -170,7 +174,11 @@ func (h *AdminHandler) GetUser(c *gin.Context) {
 	Success(c, buildFullUserResponse(user))
 }
 
-// UpdateUserRole updates a user's role (admin only)
+/**
+ * UpdateUserRole 更新用户角色（管理员专用）
+ *
+ * @route POST /api/admin/users/:id/role
+ */
 func (h *AdminHandler) UpdateUserRole(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := uuid.Parse(idStr)
@@ -235,8 +243,11 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 	Success(c, gin.H{"message": "User deleted successfully"})
 }
 
-// ResetUserPassword 管理员重置用户密码
-// PUT /api/admin/users/:id/reset-password
+/**
+ * ResetUserPassword 管理员重置用户密码
+ *
+ * @route PUT /api/admin/users/:id/reset-password
+ */
 func (h *AdminHandler) ResetUserPassword(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := uuid.Parse(idStr)
@@ -293,7 +304,7 @@ func (h *AdminHandler) UpdateUserStatus(c *gin.Context) {
 	}
 
 	var input struct {
-		Status string `json:"status" binding:"required,oneof=active suspended pending"`
+		Status string `json:"status" binding:"required,oneof=active disabled suspended pending"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		BadRequest(c, err.Error())
@@ -456,7 +467,7 @@ func (h *AdminHandler) GetAppAuthorizedUsers(c *gin.Context) {
 	}
 
 	Success(c, gin.H{
-		"authorizations": auths,
+		"authorizations": toAuthorizationResponses(auths),
 		"total":          total,
 		"page":           page,
 		"limit":          limit,
@@ -487,7 +498,7 @@ func (h *AdminHandler) GetAppStats(c *gin.Context) {
 // BatchUpdateStatusRequest represents a batch status update request
 type BatchUpdateStatusRequest struct {
 	UserIDs []string `json:"user_ids" binding:"required,min=1"`
-	Status  string   `json:"status" binding:"required,oneof=active suspended pending"`
+	Status  string   `json:"status" binding:"required,oneof=active disabled suspended pending"`
 }
 
 // BatchUpdateStatus updates status for multiple users
@@ -672,7 +683,7 @@ type ImportUserData struct {
 	Username    string `json:"username" binding:"required"`
 	Password    string `json:"password"` // Optional, will generate if empty
 	Role        string `json:"role" binding:"omitempty,oneof=admin user"`
-	Status      string `json:"status" binding:"omitempty,oneof=active suspended pending"`
+	Status      string `json:"status" binding:"omitempty,oneof=active disabled suspended pending"`
 	Nickname    string `json:"nickname"`
 	PhoneNumber string `json:"phone_number"`
 	Company     string `json:"company"`
@@ -919,7 +930,7 @@ func (h *AdminHandler) GetUserAuthorizations(c *gin.Context) {
 	}
 
 	Success(c, gin.H{
-		"authorizations": auths,
+		"authorizations": toAuthorizationResponses(auths),
 		"total":          total,
 		"page":           page,
 		"limit":          limit,
@@ -992,7 +1003,7 @@ type CreateUserRequest struct {
 	Username    string `json:"username" binding:"required,min=2"`
 	Password    string `json:"password"` // 可选，为空则自动生成
 	Role        string `json:"role" binding:"omitempty,oneof=admin user"`
-	Status      string `json:"status" binding:"omitempty,oneof=active suspended pending"`
+	Status      string `json:"status" binding:"omitempty,oneof=active disabled suspended pending"`
 	Nickname    string `json:"nickname"`
 	PhoneNumber string `json:"phone_number"`
 	Company     string `json:"company"`
@@ -1093,7 +1104,7 @@ type UpdateUserRequest struct {
 	Email         *string `json:"email" binding:"omitempty,email"`
 	Username      *string `json:"username" binding:"omitempty,min=2"`
 	Role          *string `json:"role" binding:"omitempty,oneof=admin user"`
-	Status        *string `json:"status" binding:"omitempty,oneof=active suspended pending"`
+	Status        *string `json:"status" binding:"omitempty,oneof=active disabled suspended pending"`
 	Nickname      *string `json:"nickname"`
 	GivenName     *string `json:"given_name"`
 	FamilyName    *string `json:"family_name"`

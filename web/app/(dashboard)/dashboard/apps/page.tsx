@@ -1,7 +1,9 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import Link from 'next/link';
+import { useAuth } from '@/lib/auth-context';
 import { api } from '@/lib/api';
 import { useI18n } from '@/lib/i18n';
 import { Button } from '@/components/ui/button';
@@ -10,6 +12,8 @@ import { AppWindow, Plus, Trash2, ExternalLink, Loader2 } from 'lucide-react';
 import type { Application } from '@/lib/types';
 
 export default function AppsPage() {
+  const router = useRouter();
+  const { user, isLoading: authLoading } = useAuth();
   const { t, dateLocale } = useI18n();
   const [apps, setApps] = useState<Application[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -24,8 +28,14 @@ export default function AppsPage() {
   }, []);
 
   useEffect(() => {
-    loadApps();
-  }, [loadApps]);
+    if (!authLoading && user?.role !== 'admin') {
+      router.replace('/dashboard');
+      return;
+    }
+    if (user?.role === 'admin') {
+      loadApps();
+    }
+  }, [authLoading, user?.role, router, loadApps]);
 
   const handleDelete = async (id: string) => {
     if (!confirm(t('apps.confirmDelete'))) {

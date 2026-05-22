@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"strconv"
 
 	ctx "server/internal/context"
@@ -64,6 +65,12 @@ func (h *WebhookHandler) CreateWebhook(c *gin.Context) {
 
 	webhook, err := h.webhookService.CreateWebhook(appID, req.URL, req.Secret, req.Events)
 	if err != nil {
+		if errors.Is(err, service.ErrWebhookURLInvalid) ||
+			errors.Is(err, service.ErrWebhookURLInsecure) ||
+			errors.Is(err, service.ErrWebhookURLInternal) {
+			BadRequest(c, err.Error())
+			return
+		}
 		InternalError(c, "Failed to create webhook")
 		return
 	}
@@ -121,6 +128,12 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 
 	err = h.webhookService.UpdateWebhook(webhookID, req.URL, req.Secret, req.Events, req.Active)
 	if err != nil {
+		if errors.Is(err, service.ErrWebhookURLInvalid) ||
+			errors.Is(err, service.ErrWebhookURLInsecure) ||
+			errors.Is(err, service.ErrWebhookURLInternal) {
+			BadRequest(c, err.Error())
+			return
+		}
 		InternalError(c, "Failed to update webhook")
 		return
 	}
@@ -131,6 +144,13 @@ func (h *WebhookHandler) UpdateWebhook(c *gin.Context) {
 // DeleteWebhook deletes a webhook
 // DELETE /api/apps/:id/webhooks/:webhook_id
 func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
+	appIDStr := c.Param("id")
+	appID, err := uuid.Parse(appIDStr)
+	if err != nil {
+		BadRequest(c, "Invalid app ID")
+		return
+	}
+
 	webhookIDStr := c.Param("webhook_id")
 	webhookID, err := uuid.Parse(webhookIDStr)
 	if err != nil {
@@ -138,8 +158,12 @@ func (h *WebhookHandler) DeleteWebhook(c *gin.Context) {
 		return
 	}
 
-	err = h.webhookService.DeleteWebhook(webhookID)
+	err = h.webhookService.DeleteWebhookForApp(appID, webhookID)
 	if err != nil {
+		if errors.Is(err, service.ErrWebhookNotFound) {
+			NotFound(c, "Webhook not found")
+			return
+		}
 		InternalError(c, "Failed to delete webhook")
 		return
 	}

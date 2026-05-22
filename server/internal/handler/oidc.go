@@ -8,8 +8,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
+	"server/internal/model"
 	"server/internal/repository"
+	"server/pkg/cache"
 	"server/pkg/jwt"
 
 	"github.com/gin-gonic/gin"
@@ -27,6 +30,7 @@ type OIDCHandler struct {
 	mu         sync.RWMutex
 	oauthRepo  *repository.OAuthRepository
 	jwtManager *jwt.Manager
+	cache      cache.Cache
 }
 
 /*
@@ -47,6 +51,11 @@ func NewOIDCHandler(issuer string) *OIDCHandler {
 func (h *OIDCHandler) SetOAuthRepo(oauthRepo *repository.OAuthRepository, jwtManager *jwt.Manager) {
 	h.oauthRepo = oauthRepo
 	h.jwtManager = jwtManager
+}
+
+/* SetCache 注入统一缓存实例（用于 discovery/JWKS 热读缓存） */
+func (h *OIDCHandler) SetCache(c cache.Cache) {
+	h.cache = c
 }
 
 /*
@@ -82,6 +91,14 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 		scheme = "https"
 	}
 	issuer := scheme + "://" + c.Request.Host
+	cacheKey := "oidc:discovery:" + issuer
+
+	if h.cache != nil {
+		if cached, err := cache.GetJSON[map[string]interface{}](c.Request.Context(), h.cache, cacheKey); err == nil {
+			c.JSON(http.StatusOK, cached)
+			return
+		}
+	}
 
 	discovery := map[string]interface{}{
 		// 必需字段
@@ -141,15 +158,8 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 			"none", // 公开客户端
 		},
 
-		// 支持的scope
-		"scopes_supported": []string{
-			"openid",
-			"profile",
-			"email",
-			"phone",
-			"address",
-			"offline_access",
-		},
+		// 支持的 scope（OIDC 用户 scope + 机器 scope）
+		"scopes_supported": model.AllServerSupportedScopes(),
 
 		// 支持的claims
 		"claims_supported": []string{
@@ -210,6 +220,9 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 		"federation_endpoint": issuer + "/api/federation",
 	}
 
+	if h.cache != nil {
+		_ = cache.SetJSON(c.Request.Context(), h.cache, cacheKey, discovery, 2*time.Minute)
+	}
 	c.JSON(http.StatusOK, discovery)
 }
 
@@ -217,6 +230,19 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 // GET /.well-known/jwks.json
 func (h *OIDCHandler) JWKS(c *gin.Context) {
 	h.ensureKey()
+
+	scheme := "http"
+	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	issuer := scheme + "://" + c.Request.Host
+	cacheKey := "oidc:jwks:" + issuer
+	if h.cache != nil {
+		if cached, err := cache.GetJSON[map[string]interface{}](c.Request.Context(), h.cache, cacheKey); err == nil {
+			c.JSON(http.StatusOK, cached)
+			return
+		}
+	}
 
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -242,6 +268,9 @@ func (h *OIDCHandler) JWKS(c *gin.Context) {
 		},
 	}
 
+	if h.cache != nil {
+		_ = cache.SetJSON(c.Request.Context(), h.cache, cacheKey, jwks, 2*time.Minute)
+	}
 	c.JSON(http.StatusOK, jwks)
 }
 

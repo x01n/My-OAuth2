@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 /*
@@ -192,50 +193,44 @@ func (r *UserAuthorizationRepository) GetStatsForApp(appID uuid.UUID) (*model.Us
 }
 
 /*
- * CreateOrUpdate 创建或更新授权记录（upsert 语义）
- * 功能：已存在则更新 scope、grant_type 和授权时间并取消撤销，不存在则创建新记录
+ * CreateOrUpdate 创建或更新授权记录（原子 upsert）
+ * 功能：基于唯一键 (user_id, app_id) 原子写入；已存在则更新 scope、grant_type、授权时间并取消撤销
  * @param userID    - 用户 UUID
  * @param appID     - 应用 UUID
  * @param scope     - 授权范围
  * @param grantType - 授权方式（authorization_code / device_code / client_credentials 等）
  */
 func (r *UserAuthorizationRepository) CreateOrUpdate(userID, appID uuid.UUID, scope string, grantType string) (*model.UserAuthorization, error) {
-	var auth model.UserAuthorization
-
-	// Try to find existing
-	result := r.db.Where("user_id = ? AND app_id = ?", userID, appID).First(&auth)
-
-	if result.Error == gorm.ErrRecordNotFound {
-		// Create new
-		auth = model.UserAuthorization{
-			UserID:       userID,
-			AppID:        appID,
-			Scope:        scope,
-			GrantType:    grantType,
-			AuthorizedAt: time.Now(),
-		}
-		if err := r.db.Create(&auth).Error; err != nil {
-			return nil, err
-		}
-		return &auth, nil
+	now := time.Now()
+	auth := model.UserAuthorization{
+		UserID:       userID,
+		AppID:        appID,
+		Scope:        scope,
+		GrantType:    grantType,
+		AuthorizedAt: now,
+		Revoked:      false,
+		RevokedAt:    nil,
 	}
 
-	if result.Error != nil {
-		return nil, result.Error
-	}
-
-	// Update existing
-	auth.Scope = scope
-	auth.GrantType = grantType
-	auth.AuthorizedAt = time.Now()
-	auth.Revoked = false
-	auth.RevokedAt = nil
-
-	if err := r.db.Save(&auth).Error; err != nil {
+	if err := r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "user_id"}, {Name: "app_id"}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"scope":         scope,
+			"grant_type":    grantType,
+			"authorized_at": now,
+			"revoked":       false,
+			"revoked_at":    nil,
+			"updated_at":    now,
+		}),
+	}).Create(&auth).Error; err != nil {
 		return nil, err
 	}
 
-	return &auth, nil
+	var persisted model.UserAuthorization
+	if err := r.db.Where("user_id = ? AND app_id = ?", userID, appID).First(&persisted).Error; err != nil {
+		return nil, err
+	}
+	return &persisted, nil
 }
 
 /*

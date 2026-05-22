@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,6 +24,7 @@ type OAuthHandler struct {
 	oauthService   *service.OAuthService
 	webhookService *service.WebhookService
 	frontendURL    string
+	serverBase     string // 本服务对外根 URL（用于判断是否嵌入 SPA）
 }
 
 /*
@@ -33,11 +33,12 @@ type OAuthHandler struct {
  * @param webhookService - Webhook 服务
  * @param frontendURL    - 前端 URL（用于授权重定向）
  */
-func NewOAuthHandler(oauthService *service.OAuthService, webhookService *service.WebhookService, frontendURL string) *OAuthHandler {
+func NewOAuthHandler(oauthService *service.OAuthService, webhookService *service.WebhookService, frontendURL, serverBase string) *OAuthHandler {
 	return &OAuthHandler{
 		oauthService:   oauthService,
 		webhookService: webhookService,
-		frontendURL:    frontendURL,
+		frontendURL:    strings.TrimRight(strings.TrimSpace(frontendURL), "/"),
+		serverBase:     BrowserReachableBaseURL(serverBase),
 	}
 }
 
@@ -58,22 +59,34 @@ type AuthorizeRequest struct {
  * 功能：重定向到前端授权页面，携带所有授权参数
  */
 func (h *OAuthHandler) Authorize(c *gin.Context) {
-	// Redirect to frontend for authorization UI
-	if h.frontendURL == "" {
-		// Embedded frontend - no redirect needed, let SPA handle it
-		// Return a signal that this should be handled by SPA
+	if !h.shouldRedirectAuthorizeToExternalUI(c) {
 		c.Set("serve_spa", true)
 		c.Next()
 		return
 	}
-	// Separate frontend - redirect to full URL
-	frontendAuthURL := fmt.Sprintf("%s/oauth/authorize?%s", h.frontendURL, c.Request.URL.RawQuery)
+	frontendAuthURL := h.frontendURL + "/oauth/authorize?" + c.Request.URL.RawQuery
 	c.Redirect(http.StatusFound, frontendAuthURL)
 }
 
-// IsEmbeddedFrontend returns whether we're using embedded frontend
+// IsEmbeddedFrontend 授权页由本进程嵌入 SPA 提供（无需 302 到外部前端）
 func (h *OAuthHandler) IsEmbeddedFrontend() bool {
-	return h.frontendURL == ""
+	return !h.shouldRedirectAuthorizeToExternalUI(nil)
+}
+
+func (h *OAuthHandler) shouldRedirectAuthorizeToExternalUI(c *gin.Context) bool {
+	if h.frontendURL == "" {
+		return false
+	}
+	if SamePublicOrigin(h.frontendURL, h.serverBase) {
+		return false
+	}
+	if c != nil && c.Request != nil {
+		reqBase := BrowserReachableBaseURL(requestScheme(c.Request) + "://" + requestHost(c.Request))
+		if SamePublicOrigin(h.frontendURL, reqBase) {
+			return false
+		}
+	}
+	return true
 }
 
 // GetAppInfo returns application info for authorization page
@@ -108,12 +121,66 @@ func (h *OAuthHandler) GetAppInfo(c *gin.Context) {
 		}
 	}
 
+	requestedScope := c.Query("scope")
+	responseType := c.Query("response_type")
+	scopeBreakdown := app.ParseAuthorizeScopeRequest(requestedScope)
+	issuedTypes := app.GetIssuedTokenTypesForRequest(scopeBreakdown.EffectiveScope, responseType)
 	Success(c, gin.H{
 		"app": gin.H{
-			"id":          app.ID.String(),
-			"name":        app.Name,
-			"description": app.Description,
+			"id":                       app.ID.String(),
+			"client_id":                app.ClientID,
+			"name":                     app.Name,
+			"description":              app.Description,
+			"scopes":                   app.GetUserAuthorizationScopes(),
+			"allowed_scopes":           app.GetAllowedScopes(),
+			"grant_types":              app.GetGrantTypes(),
+			"response_types_supported": app.GetResponseTypesSupported(),
+			"app_type":                 app.AppType,
+			"token_endpoint_auth_method": app.TokenEndpointAuthMethod,
+			"issued_token_types":         issuedTypes,
 		},
+		"requested_scopes":   scopeBreakdown.DisplayScopes,
+		"invalid_scopes":     scopeBreakdown.InvalidScopes,
+		"effective_scope":    scopeBreakdown.EffectiveScope,
+		"has_openid":         scopeBreakdown.HasOpenID,
+		"issued_token_types": issuedTypes,
+	})
+}
+
+// GetAuthorizePending 若存在未兑换的授权码则返回 redirect_url（避免重复授权）
+// GET /api/oauth/authorize/pending
+func (h *OAuthHandler) GetAuthorizePending(c *gin.Context) {
+	clientID := c.Query("client_id")
+	redirectURI := c.Query("redirect_uri")
+	if clientID == "" || redirectURI == "" {
+		BadRequest(c, "client_id and redirect_uri are required")
+		return
+	}
+	userID, ok := gctx.GetUserID(c)
+	if !ok {
+		Unauthorized(c, "User not authenticated")
+		return
+	}
+	result, err := h.oauthService.FindPendingAuthorization(&service.AuthorizeInput{
+		ClientID:      clientID,
+		RedirectURI:   redirectURI,
+		Scope:         c.Query("scope"),
+		State:         c.Query("state"),
+		CodeChallenge: c.Query("code_challenge"),
+		UserID:        userID,
+	})
+	if err != nil {
+		Success(c, gin.H{"pending": false})
+		return
+	}
+	redirectURL := h.buildRedirectURL(result.RedirectURI, map[string]string{
+		"code":  result.Code,
+		"state": result.State,
+	})
+	Success(c, gin.H{
+		"pending":      true,
+		"redirect_url": redirectURL,
+		"reused":       true,
 	})
 }
 
@@ -197,41 +264,49 @@ func (h *OAuthHandler) AuthorizeSubmit(c *gin.Context) {
 		return
 	}
 
-	// Emit SSE event for authorization
 	username, _ := gctx.GetUserUsername(c)
-	EmitAuthEvent(AuthEvent{
-		Type:      "oauth_authorized",
-		AppID:     app.ID.String(),
-		AppName:   app.Name,
-		UserID:    userID.String(),
-		Username:  username,
-		Scope:     req.Scope,
-		Timestamp: time.Now(),
-	})
+	email, _ := gctx.GetUserEmail(c)
 
-	// Trigger webhook for oauth.authorized
-	if h.webhookService != nil {
-		go h.webhookService.TriggerEvent(context.Background(), app.ID, model.WebhookEventOAuthAuthorized, map[string]any{
-			"user_id":   userID.String(),
-			"username":  username,
-			"client_id": app.ClientID,
-			"app_name":  app.Name,
-			"scope":     req.Scope,
-		})
+	if !result.Reused {
+		emitOAuthAuthorizedSSE(app, userID.String(), username, email, req.Scope)
+		if h.webhookService != nil {
+			go h.webhookService.TriggerEvent(context.Background(), app.ID, model.WebhookEventOAuthAuthorized, map[string]any{
+				"user_id":   userID.String(),
+				"username":  username,
+				"client_id": app.ClientID,
+				"app_name":  app.Name,
+				"scope":     req.Scope,
+			})
+		}
+		audit.Log(audit.ActionTokenIssue, audit.ResultSuccess, userID.String(), req.ClientID, c.ClientIP(), "event", "authorize_approved", "scope", req.Scope)
 	}
 
-	// Return redirect URL with authorization code
 	redirectURL := h.buildRedirectURL(result.RedirectURI, map[string]string{
 		"code":  result.Code,
 		"state": result.State,
 	})
 
-	audit.Log(audit.ActionTokenIssue, audit.ResultSuccess, userID.String(), req.ClientID, c.ClientIP(), "event", "authorize_approved", "scope", req.Scope)
-
+	scopes := strings.Fields(req.Scope)
 	Success(c, gin.H{
 		"redirect_url": redirectURL,
 		"code":         result.Code,
 		"state":        result.State,
+		"reused":       result.Reused,
+		"authorization": gin.H{
+			"scope":              req.Scope,
+			"scopes":             scopes,
+			"issued_token_types": app.GetIssuedTokenTypesForRequest(req.Scope, req.ResponseType),
+			"user": gin.H{
+				"id":       userID.String(),
+				"username": username,
+				"email":    email,
+			},
+			"app": gin.H{
+				"id":        app.ID.String(),
+				"client_id": app.ClientID,
+				"name":      app.Name,
+			},
+		},
 	})
 }
 
@@ -300,22 +375,26 @@ func (h *OAuthHandler) Token(c *gin.Context) {
 		return
 	}
 
-	// Trigger webhook for token issued event
-	if h.webhookService != nil && req.ClientID != "" {
+	// Trigger webhook + SSE for token issued event
+	if req.ClientID != "" {
 		app, _ := h.oauthService.GetApplication(req.ClientID)
 		if app != nil {
-			eventType := model.WebhookEventTokenIssued
-			if req.GrantType == "refresh_token" {
-				eventType = model.WebhookEventTokenRefreshed
+			emitOAuthTokenSSE(h.oauthService, app, req.GrantType, result.AccessToken, result.Scope)
+
+			if h.webhookService != nil {
+				eventType := model.WebhookEventTokenIssued
+				if req.GrantType == "refresh_token" {
+					eventType = model.WebhookEventTokenRefreshed
+				}
+				go h.webhookService.TriggerEvent(context.Background(), app.ID, eventType, map[string]any{
+					"client_id":  req.ClientID,
+					"grant_type": req.GrantType,
+					"scope":      result.Scope,
+					"token_type": result.TokenType,
+					"expires_in": result.ExpiresIn,
+					"issued_at":  time.Now().Unix(),
+				})
 			}
-			go h.webhookService.TriggerEvent(context.Background(), app.ID, eventType, map[string]any{
-				"client_id":  req.ClientID,
-				"grant_type": req.GrantType,
-				"scope":      result.Scope,
-				"token_type": result.TokenType,
-				"expires_in": result.ExpiresIn,
-				"issued_at":  time.Now().Unix(),
-			})
 		}
 	}
 
@@ -384,9 +463,23 @@ func (h *OAuthHandler) UserInfo(c *gin.Context) {
 	token := strings.TrimPrefix(authHeader, "Bearer ")
 	user, scope, err := h.oauthService.GetUserInfoWithScope(token)
 	if err != nil {
+		if errors.Is(err, service.ErrNoUserInToken) {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "insufficient_scope",
+				"error_description": "This access token does not represent an end-user (e.g. client_credentials)",
+			})
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error":             "invalid_token",
 			"error_description": "Invalid or expired token",
+		})
+		return
+	}
+	if user == nil {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":             "insufficient_scope",
+			"error_description": "This access token does not represent an end-user",
 		})
 		return
 	}
@@ -445,14 +538,14 @@ func (h *OAuthHandler) UserInfo(c *gin.Context) {
 		response["email_verified"] = user.EmailVerified
 	}
 
-	/* phone scope（始终返回声明，空值也返回） */
-	if scopeSet["phone"] {
+	/* phone scope（与 profile 一致：openid 时也返回声明，空值也返回） */
+	if scopeSet["phone"] || scopeSet["openid"] {
 		response["phone_number"] = user.PhoneNumber
 		response["phone_number_verified"] = user.PhoneVerified
 	}
 
-	/* address scope（始终返回声明，空值也返回） */
-	if scopeSet["address"] {
+	/* address scope（openid 时也返回空地址对象，便于 OIDC 自检） */
+	if scopeSet["address"] || scopeSet["openid"] {
 		response["address"] = user.GetAddress()
 	}
 
@@ -564,6 +657,9 @@ func (h *OAuthHandler) handleTokenError(c *gin.Context, err error) {
 		status = http.StatusBadRequest
 	case errors.Is(err, service.ErrExpiredToken):
 		errorCode = "expired_token"
+		status = http.StatusBadRequest
+	case errors.Is(err, service.ErrInvalidScope):
+		errorCode = "invalid_scope"
 		status = http.StatusBadRequest
 	default:
 		errorCode = "server_error"

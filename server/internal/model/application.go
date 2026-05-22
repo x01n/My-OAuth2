@@ -181,17 +181,351 @@ func (a *Application) SetGrantTypes(types []string) {
 }
 
 /*
+ * normalizeGrantType 将 grant_type 别名归一化（前端/URN 与存储值互通）
+ */
+func normalizeGrantType(grantType string) string {
+	switch grantType {
+	case "token-exchange", "urn:ietf:params:oauth:grant-type:token-exchange":
+		return "token_exchange"
+	case "device_code", "urn:ietf:params:oauth:grant-type:device_code":
+		return "device_code"
+	default:
+		return grantType
+	}
+}
+
+/*
  * SupportsGrantType 检查应用是否支持指定的授权类型
- * @param grantType - 待检查的 grant_type
+ * @param grantType - 待检查的 grant_type（支持 URN 别名）
  * @return bool     - 支持返回 true
  */
 func (a *Application) SupportsGrantType(grantType string) bool {
+	want := normalizeGrantType(grantType)
 	for _, gt := range a.GetGrantTypes() {
-		if gt == grantType {
+		if normalizeGrantType(gt) == want {
 			return true
 		}
 	}
 	return false
+}
+
+/* userCentricScopes 仅适用于终端用户授权（授权码/设备流等），禁止 client_credentials */
+var userCentricScopes = map[string]struct{}{
+	"openid": {}, "profile": {}, "email": {}, "phone": {}, "address": {}, "offline_access": {},
+}
+
+func DefaultUserAuthorizationScopes() []string {
+	return []string{"openid", "profile", "email", "phone", "address", "offline_access"}
+}
+
+/* DefaultMachineScopes client_credentials 默认可申请的机器 scope */
+func DefaultMachineScopes() []string {
+	return []string{"api.read", "api.write"}
+}
+
+/*
+ * AllServerSupportedScopes OIDC Discovery 与文档用：用户 scope + 机器 scope 并集
+ */
+func AllServerSupportedScopes() []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, s := range append(DefaultUserAuthorizationScopes(), DefaultMachineScopes()...) {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+/*
+ * GetUserAuthorizationScopes 终端用户授权（授权码/设备流）允许的 scope
+ * 仅含 userCentricScopes，排除应用上配置的 api.read 等机器 scope
+ */
+func (a *Application) GetUserAuthorizationScopes() []string {
+	if scopes := a.GetScopes(); len(scopes) > 0 {
+		var out []string
+		for _, s := range scopes {
+			if _, ok := userCentricScopes[s]; ok {
+				out = appendUniqueString(out, s)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return DefaultUserAuthorizationScopes()
+}
+
+/*
+ * GetOIDCScopes 同 GetUserAuthorizationScopes（OIDC 授权页 / 校验）
+ */
+func (a *Application) GetOIDCScopes() []string {
+	return a.GetUserAuthorizationScopes()
+}
+
+/* userScopeDisplayOrder 授权页展示顺序（不含 openid） */
+var userScopeDisplayOrder = []string{"profile", "email", "phone", "address", "offline_access"}
+
+/* AuthorizeScopeBreakdown 解析授权请求中的 scope */
+type AuthorizeScopeBreakdown struct {
+	DisplayScopes  []string // 授权页列表（不含 openid）
+	InvalidScopes  []string // 请求了但应用不允许或非用户 scope
+	EffectiveScope string   // 将写入授权码的 scope
+	HasOpenID      bool
+}
+
+/*
+ * ParseAuthorizeScopeRequest 解析 scope 查询参数：交集、去重、无效项分离
+ */
+func (a *Application) ParseAuthorizeScopeRequest(requestedScope string) AuthorizeScopeBreakdown {
+	var out AuthorizeScopeBreakdown
+	requestedScope = strings.TrimSpace(requestedScope)
+	if requestedScope == "" {
+		return out
+	}
+	allowed := make(map[string]struct{}, len(a.GetUserAuthorizationScopes()))
+	for _, s := range a.GetUserAuthorizationScopes() {
+		allowed[s] = struct{}{}
+	}
+	seen := make(map[string]struct{})
+	var effective []string
+	for _, rs := range strings.Fields(requestedScope) {
+		if rs == "" {
+			continue
+		}
+		if _, dup := seen[rs]; dup {
+			continue
+		}
+		seen[rs] = struct{}{}
+		if _, user := userCentricScopes[rs]; !user {
+			out.InvalidScopes = appendUniqueString(out.InvalidScopes, rs)
+			continue
+		}
+		if _, ok := allowed[rs]; !ok {
+			out.InvalidScopes = appendUniqueString(out.InvalidScopes, rs)
+			continue
+		}
+		effective = append(effective, rs)
+		if rs == "openid" {
+			out.HasOpenID = true
+		}
+	}
+	out.EffectiveScope = strings.Join(effective, " ")
+	out.DisplayScopes = orderUserScopesForDisplay(effective)
+	return out
+}
+
+func orderUserScopesForDisplay(effective []string) []string {
+	inEffective := make(map[string]struct{})
+	for _, s := range effective {
+		if s != "openid" {
+			inEffective[s] = struct{}{}
+		}
+	}
+	var ordered []string
+	for _, s := range userScopeDisplayOrder {
+		if _, ok := inEffective[s]; ok {
+			ordered = append(ordered, s)
+		}
+	}
+	for _, s := range effective {
+		if s == "openid" {
+			continue
+		}
+		if _, ok := inEffective[s]; !ok {
+			continue
+		}
+		already := false
+		for _, o := range ordered {
+			if o == s {
+				already = true
+				break
+			}
+		}
+		if !already {
+			ordered = append(ordered, s)
+		}
+	}
+	return ordered
+}
+
+/*
+ * GetResponseTypesSupported 根据 grant_types 推导 OAuth response_types（RFC 6749）
+ */
+func (a *Application) GetResponseTypesSupported() []string {
+	var out []string
+	add := func(v string) {
+		for _, existing := range out {
+			if existing == v {
+				return
+			}
+		}
+		out = append(out, v)
+	}
+	for _, gt := range a.GetGrantTypes() {
+		switch normalizeGrantType(gt) {
+		case "authorization_code":
+			add("code")
+		}
+	}
+	if a.HasOIDCScope() {
+		add("id_token")
+		add("code id_token")
+	}
+	if len(out) == 0 {
+		return []string{"code"}
+	}
+	return out
+}
+
+/* HasOIDCScope 应用是否配置 openid（可签发 id_token） */
+func (a *Application) HasOIDCScope() bool {
+	return ScopeContainsOpenID(strings.Join(a.GetOIDCScopes(), " "))
+}
+
+func appendUniqueString(out []string, v string) []string {
+	for _, existing := range out {
+		if existing == v {
+			return out
+		}
+	}
+	return append(out, v)
+}
+
+/*
+ * FilterRequestedUserScopes 授权页展示的 scope（不含 openid，已排序）
+ */
+func (a *Application) FilterRequestedUserScopes(requestedScope string) []string {
+	return a.ParseAuthorizeScopeRequest(requestedScope).DisplayScopes
+}
+
+/*
+ * GetIssuedTokenTypes 按应用 grant 推导默认可签发的令牌类型（管理端展示等）
+ */
+func (a *Application) GetIssuedTokenTypes() []string {
+	return a.GetIssuedTokenTypesForRequest("", "")
+}
+
+/*
+ * GetIssuedTokenTypesForRequest 按当前授权请求（scope、response_type）推导将签发的令牌类型
+ */
+func (a *Application) GetIssuedTokenTypesForRequest(requestedScope, responseType string) []string {
+	var out []string
+	hasUserGrant := false
+	for _, gt := range a.GetGrantTypes() {
+		switch normalizeGrantType(gt) {
+		case "authorization_code", "device_code", "refresh_token", "token_exchange":
+			hasUserGrant = true
+		}
+	}
+	if !hasUserGrant {
+		for _, gt := range a.GetGrantTypes() {
+			if normalizeGrantType(gt) == "client_credentials" {
+				return []string{"access_token"}
+			}
+		}
+		return out
+	}
+	out = appendUniqueString(out, "access_token")
+
+	for _, gt := range a.GetGrantTypes() {
+		switch normalizeGrantType(gt) {
+		case "authorization_code", "device_code", "refresh_token":
+			out = appendUniqueString(out, "refresh_token")
+		}
+	}
+	if ScopeContainsOpenID(requestedScope) || strings.Contains(responseType, "id_token") {
+		out = appendUniqueString(out, "id_token")
+	}
+	return out
+}
+
+/* ScopeContainsOpenID 是否包含 openid scope（需签发 id_token） */
+func ScopeContainsOpenID(scope string) bool {
+	for _, s := range strings.Fields(scope) {
+		if s == "openid" {
+			return true
+		}
+	}
+	return false
+}
+
+func ScopeContainsWildcard(scope string) bool {
+	for _, s := range strings.Fields(scope) {
+		if isWildcardScope(s) {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+ * isWildcardScope 通配 scope（如 all）在用户授权里可能表示“全部权限”，
+ * client_credentials 禁止签发，避免绕过 openid/profile 校验。
+ */
+func isWildcardScope(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "all", "*":
+		return true
+	default:
+		return false
+	}
+}
+
+/*
+ * ContainsUserCentricScope 是否包含 OIDC 用户类 scope
+ */
+func ContainsUserCentricScope(scope string) bool {
+	for _, s := range strings.Fields(scope) {
+		if _, ok := userCentricScopes[s]; ok {
+			return true
+		}
+		if isWildcardScope(s) {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+ * ResolveClientCredentialsScope 解析 client_credentials 可签发的 scope
+ * 规则：禁止 openid/profile 等用户 scope；必须在 AllowedScopes（或过滤后的 Scopes）白名单内
+ * @return (scope, ok) — ok=false 表示请求非法
+ */
+func (a *Application) ResolveClientCredentialsScope(requested string) (string, bool) {
+	if ContainsUserCentricScope(requested) {
+		return "", false
+	}
+	allowed := a.GetAllowedScopes()
+	if len(allowed) == 0 {
+		for _, s := range a.GetScopes() {
+			if !ContainsUserCentricScope(s) && !isWildcardScope(s) {
+				allowed = append(allowed, s)
+			}
+		}
+	}
+	if len(allowed) == 0 {
+		/* 未配置任何机器 scope 时仅允许空 scope（纯客户端身份令牌） */
+		return "", requested == ""
+	}
+	if requested == "" {
+		return strings.Join(allowed, " "), true
+	}
+	for _, rs := range strings.Fields(requested) {
+		found := false
+		for _, as := range allowed {
+			if rs == as {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "", false
+		}
+	}
+	return requested, true
 }
 
 /*
@@ -216,8 +550,19 @@ func (a *Application) SetAllowedScopes(scopes []string) {
 }
 
 /*
- * ValidateScope 校验请求的 scope 是否在允许范围内
- * 功能：用于 client_credentials 模式的 scope 校验
+ * ValidateUserAuthorizationScope 校验终端用户授权（授权码/设备流）请求的 scope
+ * @param requestedScope - 空格分隔的 scope 字符串
+ */
+func (a *Application) ValidateUserAuthorizationScope(requestedScope string) bool {
+	if strings.TrimSpace(requestedScope) == "" {
+		return true
+	}
+	br := a.ParseAuthorizeScopeRequest(requestedScope)
+	return len(br.InvalidScopes) == 0
+}
+
+/*
+ * ValidateScope 校验请求的 scope 是否在 AllowedScopes 白名单内（通用）
  * @param requestedScope - 空格分隔的 scope 字符串
  * @return bool          - 全部允许返回 true
  */
@@ -231,7 +576,8 @@ func (a *Application) ValidateScope(requestedScope string) bool {
 		allowedScopes = a.GetScopes()
 	}
 	if len(allowedScopes) == 0 {
-		return true // No restrictions
+		/* 未配置白名单时不默认放行，避免任意 scope 越权 */
+		return requestedScope == ""
 	}
 
 	// Check each requested scope

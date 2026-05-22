@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, Suspense, useCallback } from 'react';
+import { useEffect, useState, Suspense, useCallback, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth-context';
 import { useI18n } from '@/lib/i18n';
@@ -8,6 +8,22 @@ import { api } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { Loader2, Shield, Check, X, AlertCircle } from 'lucide-react';
+
+type OAuthAppInfoPayload = {
+  app: {
+    id: string;
+    name: string;
+    description: string;
+    client_id?: string;
+    scopes?: string[];
+    issued_token_types?: string[];
+  };
+  requested_scopes?: string[];
+  invalid_scopes?: string[];
+  effective_scope?: string;
+  has_openid?: boolean;
+  issued_token_types?: string[];
+};
 
 /**
  * 共享的 OAuth 授权页面内容组件
@@ -18,14 +34,20 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
   const router = useRouter();
   const { isAuthenticated, isLoading: authLoading } = useAuth();
   const { t } = useI18n();
-  
-  const [appInfo, setAppInfo] = useState<{ id: string; name: string; description: string } | null>(null);
+
+  const [appInfo, setAppInfo] = useState<OAuthAppInfoPayload['app'] | null>(null);
+  const [requestedScopes, setRequestedScopes] = useState<string[]>([]);
+  const [issuedTokenTypes, setIssuedTokenTypes] = useState<string[]>([]);
+  const [invalidScopes, setInvalidScopes] = useState<string[]>([]);
+  const [hasOpenID, setHasOpenID] = useState(false);
+  const [effectiveScope, setEffectiveScope] = useState('');
+  const [appInfoReady, setAppInfoReady] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [redirectUrl, setRedirectUrl] = useState<string | null>(null);
+  const consentSubmittedRef = useRef(false);
 
-  // OAuth parameters
   const clientId = searchParams.get('client_id');
   const redirectUri = searchParams.get('redirect_uri');
   const responseType = searchParams.get('response_type');
@@ -34,35 +56,87 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
   const codeChallenge = searchParams.get('code_challenge') || '';
   const codeChallengeMethod = searchParams.get('code_challenge_method') || '';
 
-  const loadAppInfo = useCallback(async () => {
+  const returnToAuthorize = `${basePath}?${searchParams.toString()}`;
+
+  /** 从后端拉取授权上下文（公开接口，不依赖是否已登录） */
+  const fetchAuthorizeContext = useCallback(async () => {
     if (!clientId || !redirectUri || responseType !== 'code') {
       setError(t('oauth.authorize.invalidRequest'));
+      setAppInfoReady(false);
       setIsLoading(false);
       return;
     }
 
-    const response = await api.getOAuthAppInfo(clientId, redirectUri);
-    if (response.success && response.data) {
-      setAppInfo(response.data.app);
-    } else {
-      setError(response.error?.message || t('oauth.authorize.loadFailed'));
-    }
-    setIsLoading(false);
-  }, [clientId, redirectUri, responseType, t]);
+    setIsLoading(true);
+    setAppInfoReady(false);
+    setError(null);
 
-  useEffect(() => {
-    if (!authLoading && !isAuthenticated) {
-      const returnUrl = `${basePath}?${searchParams.toString()}`;
-      router.push(`/login?return_to=${encodeURIComponent(returnUrl)}`);
+    const response = await api.getOAuthAppInfo(
+      clientId,
+      redirectUri,
+      scope || undefined,
+      responseType || undefined
+    );
+
+    if (!response.success || !response.data?.app) {
+      setError(response.error?.message || t('oauth.authorize.loadFailed'));
+      setAppInfo(null);
+      setRequestedScopes([]);
+      setIssuedTokenTypes([]);
+      setInvalidScopes([]);
+      setHasOpenID(false);
+      setEffectiveScope('');
+      setAppInfoReady(false);
+      setIsLoading(false);
       return;
     }
 
-    if (isAuthenticated) {
-      loadAppInfo();
-    }
-  }, [authLoading, isAuthenticated, searchParams, router, loadAppInfo, basePath]);
+    const data = response.data;
+    setAppInfo(data.app);
+    setRequestedScopes(data.requested_scopes ?? []);
+    setInvalidScopes(data.invalid_scopes ?? []);
+    setHasOpenID(Boolean(data.has_openid));
+    setEffectiveScope(data.effective_scope ?? '');
+    setIssuedTokenTypes(
+      uniqueList(data.issued_token_types ?? data.app.issued_token_types ?? [])
+    );
+    setAppInfoReady(true);
+    setIsLoading(false);
+  }, [clientId, redirectUri, responseType, scope, t]);
 
-  // Handle redirect in useEffect
+  /** 已登录时检查是否已有未兑换授权码，可直接跳转 callback */
+  const checkPendingRedirect = useCallback(async () => {
+    if (!clientId || !redirectUri || consentSubmittedRef.current) return;
+
+    const pending = await api.getOAuthAuthorizePending({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      scope: scope || undefined,
+      state: state || undefined,
+      code_challenge: codeChallenge || undefined,
+    });
+
+    if (pending.success && pending.data?.pending && pending.data.redirect_url) {
+      consentSubmittedRef.current = true;
+      setRedirectUrl(pending.data.redirect_url);
+    }
+  }, [clientId, redirectUri, scope, state, codeChallenge]);
+
+  useEffect(() => {
+    void fetchAuthorizeContext();
+  }, [fetchAuthorizeContext]);
+
+  useEffect(() => {
+    if (authLoading || !appInfoReady || consentSubmittedRef.current) return;
+
+    if (!isAuthenticated) {
+      router.replace(`/login?return_to=${encodeURIComponent(returnToAuthorize)}`);
+      return;
+    }
+
+    void checkPendingRedirect();
+  }, [authLoading, isAuthenticated, appInfoReady, router, returnToAuthorize, checkPendingRedirect]);
+
   useEffect(() => {
     if (redirectUrl) {
       window.location.href = redirectUrl;
@@ -71,9 +145,15 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
 
   const handleConsent = async (allow: boolean) => {
     if (!clientId || !redirectUri || !responseType) return;
-    
+    if (consentSubmittedRef.current || isSubmitting) return;
+
+    if (!isAuthenticated) {
+      router.push(`/login?return_to=${encodeURIComponent(returnToAuthorize)}`);
+      return;
+    }
+
     setIsSubmitting(true);
-    
+
     try {
       const response = await api.submitOAuthAuthorize({
         client_id: clientId,
@@ -85,9 +165,9 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
         code_challenge_method: codeChallengeMethod || undefined,
         consent: allow ? 'allow' : 'deny',
       });
-      
+
       if (response.success && response.data?.redirect_url) {
-        // Redirect to the callback URL with authorization code
+        consentSubmittedRef.current = true;
         setRedirectUrl(response.data.redirect_url);
       } else {
         setError(response.error?.message || t('oauth.authorize.authFailed'));
@@ -99,18 +179,19 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
     }
   };
 
-  const parseScopes = (scopeString: string): string[] => {
-    if (!scopeString) return [];
-    return scopeString.split(' ').filter(s => s.trim() !== '');
-  };
-
-  const getScopeDescription = (scope: string): string => {
-    const key = `oauth.scopes.${scope}`;
+  const getScopeDescription = (scopeName: string) => {
+    const key = `oauth.scopes.${scopeName}`;
     const translated = t(key);
-    return translated !== key ? translated : scope;
+    return translated !== key ? translated : scopeName;
   };
 
-  if (authLoading || isLoading) {
+  const getTokenTypeLabel = (tokenType: string) => {
+    const key = `oauth.tokenTypes.${tokenType}`;
+    const translated = t(key);
+    return translated !== key ? translated : tokenType;
+  };
+
+  if (isLoading || !appInfoReady) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800">
         <Loader2 className="h-8 w-8 animate-spin text-primary" />
@@ -118,7 +199,7 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
     );
   }
 
-  if (error) {
+  if (error || !appInfo) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800 p-4">
         <Card className="w-full max-w-md">
@@ -129,7 +210,7 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
               </div>
             </div>
             <CardTitle>{t('oauth.authorize.error')}</CardTitle>
-            <CardDescription>{error}</CardDescription>
+            <CardDescription>{error || t('oauth.authorize.loadFailed')}</CardDescription>
           </CardHeader>
           <CardFooter className="justify-center">
             <Button variant="outline" onClick={() => window.history.back()}>
@@ -150,17 +231,23 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
               <Shield className="h-8 w-8 text-primary" />
             </div>
           </div>
-          <CardTitle className="text-xl">{t('oauth.authorize.title', { app: appInfo?.name || '' })}</CardTitle>
+          <CardTitle className="text-xl">{t('oauth.authorize.title', { app: appInfo.name })}</CardTitle>
           <CardDescription>
-            {appInfo?.description || t('oauth.authorize.description')}
+            {appInfo.description || t('oauth.authorize.description')}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {scope && parseScopes(scope).length > 0 && (
+          {(requestedScopes.length > 0 || hasOpenID) ? (
             <div className="space-y-2">
               <p className="text-sm font-medium">{t('oauth.authorize.permissions')}</p>
               <ul className="space-y-2">
-                {parseScopes(scope).map((s) => (
+                {hasOpenID && requestedScopes.length === 0 && (
+                  <li className="flex items-start gap-2 text-sm">
+                    <Check className="h-4 w-4 text-green-500 mt-0.5 flex-shrink-0" />
+                    <span>{t('oauth.scopes.openid')}</span>
+                  </li>
+                )}
+                {requestedScopes.map((s) => (
                   <li key={s} className="flex items-start gap-2 text-sm">
                     <Check className="h-4 w-4 text-green-500 mt-0.5 flex-shrink-0" />
                     <span>{getScopeDescription(s)}</span>
@@ -168,8 +255,29 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
                 ))}
               </ul>
             </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">{t('oauth.authorize.noExtraScopes')}</p>
           )}
-          
+
+          {invalidScopes.length > 0 && (
+            <p className="text-xs text-destructive">
+              {t('oauth.authorize.invalidScopesHint', { scopes: invalidScopes.join(', ') })}
+            </p>
+          )}
+
+          {issuedTokenTypes.length > 0 && (
+            <p className="text-xs text-muted-foreground">
+              {t('oauth.authorize.tokenTypes')}:{' '}
+              {issuedTokenTypes.map(getTokenTypeLabel).join(', ')}
+            </p>
+          )}
+
+          {effectiveScope ? (
+            <p className="text-xs text-muted-foreground font-mono break-all">
+              {t('oauth.authorize.effectiveScope')}: {effectiveScope}
+            </p>
+          ) : null}
+
           <div className="text-xs text-muted-foreground bg-slate-100 dark:bg-slate-800 p-3 rounded-md">
             <p>{t('oauth.authorize.redirectTo')}</p>
             <p className="font-mono truncate mt-1">{redirectUri}</p>
@@ -180,7 +288,7 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
             variant="outline"
             className="flex-1"
             onClick={() => handleConsent(false)}
-            disabled={isSubmitting}
+            disabled={isSubmitting || !!redirectUrl || invalidScopes.length > 0}
           >
             <X className="mr-2 h-4 w-4" />
             {t('oauth.authorize.deny')}
@@ -188,7 +296,7 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
           <Button
             className="flex-1"
             onClick={() => handleConsent(true)}
-            disabled={isSubmitting}
+            disabled={isSubmitting || !!redirectUrl || invalidScopes.length > 0}
           >
             {isSubmitting ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -203,16 +311,24 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
   );
 }
 
-/**
- * 共享的授权页面包装组件，带 Suspense fallback
- */
+function uniqueList(items: string[]): string[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (!item || seen.has(item)) return false;
+    seen.add(item);
+    return true;
+  });
+}
+
 export default function AuthorizePage({ basePath }: { basePath: string }) {
   return (
-    <Suspense fallback={
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800">
-        <Loader2 className="h-8 w-8 animate-spin text-primary" />
-      </div>
-    }>
+    <Suspense
+      fallback={
+        <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-800">
+          <Loader2 className="h-8 w-8 animate-spin text-primary" />
+        </div>
+      }
+    >
       <AuthorizeContent basePath={basePath} />
     </Suspense>
   );

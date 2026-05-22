@@ -29,9 +29,26 @@ import (
 )
 
 var client *oauth2.Client
-var serverURL = "http://localhost:8080"
+const defaultOAuthServerURL = "http://localhost:28080"
+const testRedirectURL = "http://localhost:9000/callback"
+
+var serverURL = defaultOAuthServerURL
 var clientID = ""
 var clientSecret = ""
+
+/* buildTestOAuthConfig 与 Web 授权页 /login 流程一致：浏览器打开 OAuth 站点授权 + 必要时在 Web 登录 */
+func buildTestOAuthConfig() *oauth2.Config {
+	return &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		RedirectURL:  testRedirectURL,
+		Scopes:       []string{"openid", "profile", "email", "phone", "address"},
+		AuthURL:      serverURL + "/oauth/authorize",
+		TokenURL:     serverURL + "/oauth/token",
+		UserInfoURL:  serverURL + "/oauth/userinfo",
+		UsePKCE:      true,
+	}
+}
 
 // 存储收到的webhook
 var webhookLogs = make([]WebhookLog, 0)
@@ -52,23 +69,12 @@ func main() {
 	}
 
 	// 配置 OAuth2 客户端 - 替换为你的实际值
-	clientID = getEnvOrDefault("OAUTH_CLIENT_ID", "491dd7eadda1ce59d6a89cfcc3b38e1d")
-	clientSecret = getEnvOrDefault("OAUTH_CLIENT_SECRET", "bdf71b06cd4d70b837ae868e082e6bbc100fca8e06a2d705912e7836f9725bfe")
-	serverURL = getEnvOrDefault("OAUTH_SERVER_URL", "http://localhost:8080")
-
-	config := &oauth2.Config{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		RedirectURL:  "http://localhost:9000/callback",
-		Scopes:       []string{"openid", "profile", "email", "phone", "address"},
-		AuthURL:      serverURL + "/oauth/authorize",
-		TokenURL:     serverURL + "/oauth/token",
-		UserInfoURL:  serverURL + "/oauth/userinfo",
-		UsePKCE:      true,
-	}
+	clientID = getEnvOrDefault("OAUTH_CLIENT_ID", "db84c0d44df5b5a611d0e498c769023c")
+	clientSecret = getEnvOrDefault("OAUTH_CLIENT_SECRET", "5ffb4224b5de948c0a38d3459b4e600635c9356c8a09cbd000c949543c1def2c")
+	serverURL = getEnvOrDefault("OAUTH_SERVER_URL", defaultOAuthServerURL)
 
 	var err error
-	client, err = oauth2.NewClient(config)
+	client, err = oauth2.NewClient(buildTestOAuthConfig())
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
@@ -96,7 +102,7 @@ func main() {
 	fmt.Println("║  Web界面: http://localhost:9000                          ║")
 	fmt.Println("║                                                          ║")
 	fmt.Println("║  授权流程:                                               ║")
-	fmt.Println("║  - /login              Authorization Code + PKCE         ║")
+	fmt.Println("║  - /login              跳转 OAuth Web 授权页(需 Web 登录)   ║")
 	fmt.Println("║  - /device             Device Flow (设备流)              ║")
 	fmt.Println("║  - /client-credentials Client Credentials (机器认证)    ║")
 	fmt.Println("║  - /token-exchange     Token Exchange (令牌交换)         ║")
@@ -126,6 +132,44 @@ func getEnvOrDefault(key, defaultVal string) string {
 	return defaultVal
 }
 
+/* printTokenBox 打印 OAuth 三类令牌摘要 */
+func printTokenBox(token *oauth2.Token) {
+	if token == nil {
+		return
+	}
+	fmt.Println("\n┌─────────────────────────────────────────────────┐")
+	fmt.Println("│               Token 信息                        │")
+	fmt.Println("├─────────────────────────────────────────────────┤")
+	if token.AccessToken != "" {
+		fmt.Printf("│ access_token:  %s...%-10s │\n", token.AccessToken[:min(20, len(token.AccessToken))], "")
+	}
+	if token.RefreshToken != "" {
+		fmt.Printf("│ refresh_token: %s...%-10s │\n", token.RefreshToken[:min(20, len(token.RefreshToken))], "")
+	}
+	if token.IDToken != "" {
+		fmt.Printf("│ id_token:      %s...%-10s │\n", token.IDToken[:min(20, len(token.IDToken))], "")
+	}
+	fmt.Printf("│ Token Type:   %-33s │\n", token.TokenType)
+	if !token.Expiry.IsZero() {
+		fmt.Printf("│ 过期时间:     %-33s │\n", token.Expiry.Format("2006-01-02 15:04:05"))
+	}
+	fmt.Println("└─────────────────────────────────────────────────┘")
+}
+
+func oauthClientCredentialsHint(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "invalid_scope"):
+		return "应用未配置机器 scope（allowed_scopes）。请在 Dashboard 为应用添加 api.read，或 scope 留空仅获取客户端身份令牌。"
+	case strings.Contains(msg, "invalid_grant"):
+		return "请确认应用已启用 client_credentials，且为 confidential/machine 类型。"
+	case strings.Contains(msg, "invalid_client"):
+		return "请检查 OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET 是否与 Dashboard 一致。"
+	default:
+		return "机器认证不能使用 openid/profile 等用户 scope。"
+	}
+}
+
 // ============================================================================
 // CLI Mode - 命令行模式
 // ============================================================================
@@ -133,21 +177,10 @@ func getEnvOrDefault(key, defaultVal string) string {
 func runCLI() {
 	clientID = getEnvOrDefault("OAUTH_CLIENT_ID", "70e2c01bc1c780287047594ec1967279")
 	clientSecret = getEnvOrDefault("OAUTH_CLIENT_SECRET", "f6abbeec2e27f9d13c93473cbc84bde1bdf34be6eeb321708ce62f27a259f534")
-	serverURL = getEnvOrDefault("OAUTH_SERVER_URL", "http://localhost:8080")
-
-	config := &oauth2.Config{
-		ClientID:     clientID,
-		ClientSecret: clientSecret,
-		RedirectURL:  "http://localhost:9000/callback",
-		Scopes:       []string{"openid", "profile", "email"},
-		AuthURL:      serverURL + "/oauth/authorize",
-		TokenURL:     serverURL + "/oauth/token",
-		UserInfoURL:  serverURL + "/oauth/userinfo",
-		UsePKCE:      true,
-	}
+	serverURL = getEnvOrDefault("OAUTH_SERVER_URL", defaultOAuthServerURL)
 
 	var err error
-	client, err = oauth2.NewClient(config)
+	client, err = oauth2.NewClient(buildTestOAuthConfig())
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
 	}
@@ -192,7 +225,7 @@ OAuth2 CLI 测试工具
 环境变量:
   OAUTH_CLIENT_ID      客户端ID
   OAUTH_CLIENT_SECRET  客户端密钥
-  OAUTH_SERVER_URL     OAuth服务器地址 (默认: http://localhost:8080)
+  OAUTH_SERVER_URL     OAuth服务器地址 (默认: http://localhost:28080)
 
 示例:
   ./test device                    # 设备流登录
@@ -215,20 +248,16 @@ func cliDeviceFlow() {
 		switch status {
 		case "device_code":
 			if deviceAuth, ok := data.(*oauth2.DeviceAuthResponse); ok {
+				visitURL := oauth2.ResolveDeviceVerificationURL(serverURL, deviceAuth)
 				fmt.Println("\n┌─────────────────────────────────────────────────┐")
-				fmt.Printf("│  请访问: %-38s │\n", deviceAuth.VerificationURI)
+				fmt.Printf("│  请访问: %-38s │\n", truncateStr(visitURL, 38))
 				fmt.Printf("│  输入验证码: %-34s │\n", deviceAuth.UserCode)
-				fmt.Println("├─────────────────────────────────────────────────┤")
-				if deviceAuth.VerificationURIComplete != "" {
-					fmt.Printf("│  或直接访问: %-33s │\n", truncateStr(deviceAuth.VerificationURIComplete, 33))
-				}
 				fmt.Printf("│  有效期: %-37d秒 │\n", deviceAuth.ExpiresIn)
 				fmt.Println("└─────────────────────────────────────────────────┘")
 				fmt.Println("\n等待授权中...")
 
-				// 尝试打开浏览器
-				if deviceAuth.VerificationURIComplete != "" {
-					openBrowser(deviceAuth.VerificationURIComplete)
+				if visitURL != "" {
+					openBrowser(visitURL)
 				}
 			}
 		case "pending":
@@ -251,13 +280,7 @@ func cliDeviceFlow() {
 		return
 	}
 
-	fmt.Println("\n┌─────────────────────────────────────────────────┐")
-	fmt.Println("│               Token 信息                        │")
-	fmt.Println("├─────────────────────────────────────────────────┤")
-	fmt.Printf("│ Access Token: %s...%-10s │\n", token.AccessToken[:20], "")
-	fmt.Printf("│ Token Type:   %-33s │\n", token.TokenType)
-	fmt.Printf("│ 过期时间:     %-33s │\n", token.Expiry.Format("2006-01-02 15:04:05"))
-	fmt.Println("└─────────────────────────────────────────────────┘")
+	printTokenBox(token)
 
 	// 获取用户信息
 	cliUserInfo()
@@ -331,13 +354,7 @@ func cliAuthCodeFlow() {
 	case token := <-tokenChan:
 		server.Shutdown(context.Background())
 		fmt.Println("\n✓ 授权成功!")
-		fmt.Println("\n┌─────────────────────────────────────────────────┐")
-		fmt.Println("│               Token 信息                        │")
-		fmt.Println("├─────────────────────────────────────────────────┤")
-		fmt.Printf("│ Access Token: %s...%-10s │\n", token.AccessToken[:min(20, len(token.AccessToken))], "")
-		fmt.Printf("│ Token Type:   %-33s │\n", token.TokenType)
-		fmt.Printf("│ 过期时间:     %-33s │\n", token.Expiry.Format("2006-01-02 15:04:05"))
-		fmt.Println("└─────────────────────────────────────────────────┘")
+		printTokenBox(token)
 		cliUserInfo()
 
 	case err := <-errChan:
@@ -358,15 +375,17 @@ func cliClientCredentials() {
 
 	ctx := context.Background()
 	resp, err := client.ClientCredentials(ctx, &oauth2.ClientCredentialsRequest{
-		Scope: "openid profile",
+		Scope: "api.read",
 	})
 
 	if err != nil {
 		fmt.Printf("\n✗ 错误: %v\n", err)
+		fmt.Println("  提示: client_credentials 不能使用 openid/profile 等用户 scope，请在应用里配置 api.read 等机器 scope。")
 		return
 	}
 
 	fmt.Println("\n✓ 获取Token成功!")
+	fmt.Println("  说明: 机器令牌不会写入登录会话，不能用于 Token Exchange / UserInfo。")
 	fmt.Println("\n┌─────────────────────────────────────────────────┐")
 	fmt.Println("│           Client Credentials Token              │")
 	fmt.Println("├─────────────────────────────────────────────────┤")
@@ -383,18 +402,12 @@ func cliTokenExchange() {
 	fmt.Println("║          Token Exchange - 令牌交换               ║")
 	fmt.Println("╚══════════════════════════════════════════════════╝")
 
-	// 先获取一个token
 	token, err := client.GetToken(context.Background())
-	if err != nil {
-		fmt.Println("\n需要先登录获取Token,尝试使用Client Credentials...")
-		resp, err := client.ClientCredentials(context.Background(), &oauth2.ClientCredentialsRequest{
-			Scope: "openid profile",
-		})
-		if err != nil {
-			fmt.Printf("\n✗ 无法获取Token: %v\n", err)
-			return
-		}
-		token = &oauth2.Token{AccessToken: resp.AccessToken}
+	if err != nil || token == nil || token.RefreshToken == "" {
+		fmt.Println("\n✗ 需要用户委托令牌（含 refresh_token）作为 subject_token。")
+		fmt.Println("  请先执行: login / device / auth，再执行 token-exchange。")
+		fmt.Println("  client_credentials 机器令牌不能用于令牌交换（服务端返回 invalid_grant）。")
+		return
 	}
 
 	// 执行Token Exchange
@@ -488,7 +501,7 @@ func cliTestAll() {
 	// 3. 测试Client Credentials
 	fmt.Print("[3/5] Client Credentials... ")
 	ccResp, err := client.ClientCredentials(context.Background(), &oauth2.ClientCredentialsRequest{
-		Scope: "openid",
+		Scope: "api.read",
 	})
 	if err == nil && ccResp.AccessToken != "" {
 		fmt.Println("✓ PASS")
@@ -623,8 +636,8 @@ code { background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 14p
 <div class="status status-warning">⚠ 未登录</div>
 <div class="card">
 <h2>开始授权</h2>
-<p>点击下方按钮开始 OAuth2 PKCE 授权流程</p>
-<a href="/login" class="btn btn-primary">使用 OAuth2 登录</a>
+<p>流程：本页 → OAuth 站点授权页 →（未登录则 Web 登录）→ 点「授权」→ 回到本客户端回调</p>
+<a href="/login" class="btn btn-primary">使用 OAuth2 登录（Web 授权页）</a>
 </div>
 {{end}}
 
@@ -637,17 +650,23 @@ code { background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 14p
 
 <div class="card">
 <h2>配置信息</h2>
-<p><strong>授权端点:</strong> <code>http://localhost:8080/oauth/authorize</code></p>
-<p><strong>Token端点:</strong> <code>http://localhost:8080/oauth/token</code></p>
-<p><strong>UserInfo端点:</strong> <code>http://localhost:8080/oauth/userinfo</code></p>
-<p><strong>回调地址:</strong> <code>http://localhost:9000/callback</code></p>
-<p><strong>Scopes:</strong> <code>openid profile email phone address</code></p>
+<p><strong>OAuth 站点:</strong> <code>{{.ServerURL}}</code></p>
+<p><strong>授权端点:</strong> <code>{{.ServerURL}}/oauth/authorize</code>（嵌入 Web 授权 UI）</p>
+<p><strong>Token端点:</strong> <code>{{.ServerURL}}/oauth/token</code></p>
+<p><strong>UserInfo端点:</strong> <code>{{.ServerURL}}/oauth/userinfo</code></p>
+<p><strong>回调地址:</strong> <code>{{.RedirectURL}}</code></p>
+<p><strong>Scopes:</strong> <code>{{.Scopes}}</code></p>
 </div>
 </body>
 </html>`
 
 	tmpl := template.Must(template.New("home").Parse(html))
-	tmpl.Execute(w, map[string]interface{}{"IsLoggedIn": isLoggedIn})
+	tmpl.Execute(w, map[string]interface{}{
+		"IsLoggedIn":  isLoggedIn,
+		"ServerURL":   serverURL,
+		"RedirectURL": testRedirectURL,
+		"Scopes":      strings.Join(buildTestOAuthConfig().Scopes, " "),
+	})
 }
 
 func handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -656,7 +675,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Printf("[LOGIN] 重定向到授权页面: %s\n", authURL)
+	fmt.Printf("[LOGIN] 打开 OAuth Web 授权页（未登录会先进入 %s/login，再回到授权页）: %s\n", serverURL, authURL)
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
@@ -680,8 +699,13 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Printf("[TOKEN] Access Token: %s...\n", token.AccessToken[:min(20, len(token.AccessToken))])
-	fmt.Printf("[TOKEN] Refresh Token: %s...\n", token.RefreshToken[:min(20, len(token.RefreshToken))])
+	fmt.Printf("[TOKEN] access_token: %s...\n", token.AccessToken[:min(20, len(token.AccessToken))])
+	if token.RefreshToken != "" {
+		fmt.Printf("[TOKEN] refresh_token: %s...\n", token.RefreshToken[:min(20, len(token.RefreshToken))])
+	}
+	if token.IDToken != "" {
+		fmt.Printf("[TOKEN] id_token: %s...\n", token.IDToken[:min(20, len(token.IDToken))])
+	}
 	fmt.Printf("[TOKEN] 过期时间: %s\n", token.Expiry)
 
 	// 授权成功后立即获取用户信息
@@ -695,10 +719,49 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/userinfo", http.StatusFound)
 }
 
+// probeUserInfo 用指定 access_token 调用 UserInfo（不读会话），用于隔离测试机器令牌。
+func probeUserInfo(accessToken string) (status int, body string, err error) {
+	req, err := http.NewRequest("GET", serverURL+"/oauth/userinfo", nil)
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b), nil
+}
+
 func handleUserInfo(w http.ResponseWriter, r *http.Request) {
+	tokenSource := "当前登录会话（用户委托令牌）"
+	isolated := r.URL.Query().Get("access_token")
+
+	if isolated != "" {
+		tokenSource = "隔离测试：仅使用 URL 中的 access_token（未读会话）"
+		status, body, err := probeUserInfo(isolated)
+		if err != nil {
+			renderMessage(w, "UserInfo 请求失败", err.Error(), "error")
+			return
+		}
+		renderUserInfoProbeResult(w, tokenSource, status, body)
+		return
+	}
+
+	sess, _ := client.GetToken(context.Background())
+	if sess != nil && sess.RefreshToken == "" {
+		renderMessage(w, "无法展示用户资料",
+			"当前会话中的 access_token 没有 refresh_token，多半是机器令牌或未完整登录。\n\n"+
+				"请先 /login 或 /device；若刚获取 client_credentials 令牌，请在 CC 结果页点击「用此机器令牌测试 UserInfo」验证应返回 403。",
+			"error")
+		return
+	}
+
 	userInfo, err := client.GetUserInfo(context.Background())
 	if err != nil {
-		http.Redirect(w, r, "/", http.StatusFound)
+		renderMessage(w, "UserInfo 失败", fmt.Sprintf("%v\n\n（%s）", err, tokenSource), "error")
 		return
 	}
 
@@ -779,9 +842,37 @@ pre { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 8px; ov
 	})
 }
 
+func renderUserInfoProbeResult(w http.ResponseWriter, tokenSource string, status int, body string) {
+	ok := status == http.StatusOK
+	title := "UserInfo 隔离测试"
+	color := "#ef4444"
+	if ok {
+		color = "#22c55e"
+		title = "UserInfo 返回了用户资料"
+	}
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>%s</title>
+<style>body{font-family:system-ui;max-width:800px;margin:40px auto;padding:0 20px;background:#f8fafc}
+.card{background:#fff;border-radius:12px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+h1{color:%s}pre{background:#1e293b;color:#e2e8f0;padding:16px;border-radius:8px;overflow:auto}
+.note{background:#fef3c7;padding:12px;border-radius:8px;margin:12px 0;font-size:14px}
+.btn{display:inline-block;margin-top:16px;padding:10px 16px;background:#e2e8f0;border-radius:8px;text-decoration:none;color:#475569}
+</style></head><body><div class="card">
+<h1>%s</h1>
+<p><strong>HTTP %d</strong> — %s</p>
+<div class="note">机器令牌（client_credentials）应得到 <strong>403 insufficient_scope</strong>；只有用户委托令牌才应 200 并含 sub。</div>
+<pre>%s</pre>
+<a href="/userinfo" class="btn">返回会话 UserInfo</a>
+<a href="/" class="btn">首页</a>
+</div></body></html>`, title, color, title, status, tokenSource, body)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(html))
+}
+
 func handleLogout(w http.ResponseWriter, r *http.Request) {
-	client.Logout()
-	fmt.Println("[LOGOUT] 已清除本地 Token")
+	if err := client.Logout(true); err != nil {
+		_ = client.Logout()
+	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
@@ -1333,12 +1424,16 @@ func handleIntrospect(w http.ResponseWriter, r *http.Request) {
 func handleTokenInfo(w http.ResponseWriter, r *http.Request) {
 	token, err := client.GetToken(context.Background())
 	if err != nil || token == nil {
-		renderMessage(w, "错误", "未登录，请先授权", "error")
+		renderMessage(w, "错误", "未登录，请先 /login 或 /device", "error")
 		return
 	}
 
-	// 获取用户信息
-	userInfo, _ := client.GetUserInfo(context.Background())
+	tokenKind := "用户委托（含 refresh_token）"
+	if token.RefreshToken == "" {
+		tokenKind = "疑似机器令牌（无 refresh_token）— UserInfo 可能失败"
+	}
+
+	userInfo, userInfoErr := client.GetUserInfo(context.Background())
 
 	// 获取Token自省结果
 	reqBody := fmt.Sprintf("token=%s&client_id=%s&client_secret=%s",
@@ -1394,6 +1489,7 @@ pre { background: #1e293b; color: #e2e8f0; padding: 12px; border-radius: 8px; ov
 		}
 		return "✗ 已过期"
 	}() + `</span></div>
+<div class="info-row"><span class="info-label">令牌类别</span><span class="info-value">` + tokenKind + `</span></div>
 </div>
 
 <div class="card">
@@ -1407,6 +1503,22 @@ pre { background: #1e293b; color: #e2e8f0; padding: 12px; border-radius: 8px; ov
 	}() + `">` + func() string {
 		if token.RefreshToken != "" {
 			return "✓ 是"
+		}
+		return "✗ 无"
+	}() + `</span></div>
+</div>
+
+<div class="card">
+<h2><span>🪪</span> ID Token</h2>
+<div class="info-row"><span class="info-label">Token</span><span class="info-value">` + maskToken(token.IDToken) + `</span></div>
+<div class="info-row"><span class="info-label">可用</span><span class="info-value ` + func() string {
+		if token.IDToken != "" {
+			return "valid"
+		}
+		return "invalid"
+	}() + `">` + func() string {
+		if token.IDToken != "" {
+			return "✓ 是（scope 含 openid）"
 		}
 		return "✗ 无"
 	}() + `</span></div>
@@ -1445,13 +1557,18 @@ pre { background: #1e293b; color: #e2e8f0; padding: 12px; border-radius: 8px; ov
 			}
 		}
 	} else {
-		html += `<div class="info-row"><span class="info-label">状态</span><span class="info-value invalid">获取失败</span></div>`
+		msg := "获取失败（机器令牌应返回 insufficient_scope）"
+		if userInfoErr != nil {
+			msg = userInfoErr.Error()
+		}
+		html += `<div class="info-row"><span class="info-label">状态</span><span class="info-value invalid">` + msg + `</span></div>`
 	}
 
 	html += `</div>
 
 <div class="card">
 <h2><span>🔍</span> Token 自省结果</h2>
+<p style="font-size:12px;color:#64748b;margin:0 0 8px">有 <code>sub</code> 才是用户令牌；仅 <code>active</code>/<code>scope</code> 可能是机器令牌。</p>
 <pre>` + func() string { b, _ := json.MarshalIndent(introspectResult, "", "  "); return string(b) }() + `</pre>
 </div>
 </div>
@@ -1752,6 +1869,12 @@ func handleDeviceFlow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		visitURL := oauth2.ResolveDeviceVerificationURL(serverURL, deviceAuth)
+		openURL := visitURL
+		if openURL == "" {
+			openURL = deviceAuth.VerificationURIComplete
+		}
+
 		// 返回设备码信息
 		html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -1829,10 +1952,10 @@ setTimeout(poll, interval * 1000);
 </script>
 </body>
 </html>`,
-			deviceAuth.VerificationURI,
+			visitURL,
 			deviceAuth.UserCode,
 			deviceAuth.ExpiresIn,
-			deviceAuth.VerificationURIComplete,
+			openURL,
 			deviceAuth.DeviceCode,
 			deviceAuth.Interval,
 			deviceAuth.ExpiresIn/deviceAuth.Interval)
@@ -1912,7 +2035,7 @@ func handleClientCredentials(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		scope := r.FormValue("scope")
 		if scope == "" {
-			scope = "openid profile"
+			scope = "api.read"
 		}
 
 		ctx := context.Background()
@@ -1921,7 +2044,7 @@ func handleClientCredentials(w http.ResponseWriter, r *http.Request) {
 		})
 
 		if err != nil {
-			renderMessage(w, "错误", fmt.Sprintf("客户端凭据授权失败: %v", err), "error")
+			renderMessage(w, "错误", fmt.Sprintf("客户端凭据授权失败: %v\n\n%s", err, oauthClientCredentialsHint(err)), "error")
 			return
 		}
 
@@ -1947,11 +2070,13 @@ pre { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 8px; ov
 <div class="info"><span>Scope</span><strong>%s</strong></div>
 <h3>完整响应</h3>
 <pre>%s</pre>
+<p style="font-size:14px;color:#64748b">此令牌<strong>不会</strong>写入登录会话。可用下方链接单独测 UserInfo（预期 403）。</p>
+<a href="/userinfo?access_token=%s" class="btn" style="background:#fef3c7">用此机器令牌测试 UserInfo</a>
 <a href="/client-credentials" class="btn">重新获取</a>
 <a href="/" class="btn">返回首页</a>
 </div>
 </body>
-</html>`, resp.TokenType, resp.ExpiresIn, resp.Scope, string(prettyJSON))
+</html>`, resp.TokenType, resp.ExpiresIn, resp.Scope, string(prettyJSON), url.QueryEscape(resp.AccessToken))
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(html))
@@ -1987,7 +2112,7 @@ h1 { color: #1e293b; }
 <form method="POST">
 <div class="form-group">
 <label>Scope (可选)</label>
-<input type="text" name="scope" value="openid profile" placeholder="openid profile email">
+<input type="text" name="scope" value="api.read" placeholder="api.read（勿填 openid/profile）">
 </div>
 <button type="submit" class="btn">🔑 获取 Access Token</button>
 </form>
@@ -2007,10 +2132,9 @@ func handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 		scope := r.FormValue("scope")
 
 		if subjectToken == "" {
-			// 尝试从当前会话获取
 			token, err := client.GetToken(context.Background())
-			if err != nil || token == nil {
-				renderMessage(w, "错误", "请提供 subject_token 或先登录获取Token", "error")
+			if err != nil || token == nil || token.RefreshToken == "" {
+				renderMessage(w, "错误", "请粘贴用户授权得到的 subject_token，或先通过 /login、/device 登录（client_credentials 令牌不能用于交换）", "error")
 				return
 			}
 			subjectToken = token.AccessToken
@@ -2045,6 +2169,11 @@ func handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 		if resp.StatusCode != http.StatusOK {
 			statusColor = "#ef4444"
 			statusText = fmt.Sprintf("❌ Token Exchange 失败 (HTTP %d)", resp.StatusCode)
+			if errDesc, ok := result["error_description"].(string); ok && errDesc != "" {
+				statusText += " — " + errDesc
+			} else if errCode, ok := result["error"].(string); ok {
+				statusText += " — " + errCode
+			}
 		}
 
 		html := fmt.Sprintf(`<!DOCTYPE html>
@@ -2074,11 +2203,12 @@ pre { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 8px; ov
 		return
 	}
 
-	// 获取当前token（如果有）
 	currentToken := ""
+	currentHint := "（未检测到用户登录会话，请先 /login 或 /device）"
 	token, _ := client.GetToken(context.Background())
-	if token != nil {
+	if token != nil && token.RefreshToken != "" {
 		currentToken = token.AccessToken
+		currentHint = "（已填入当前用户会话令牌，可用于 RFC 8693 交换）"
 	}
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
@@ -2101,10 +2231,12 @@ h1 { color: #1e293b; }
 <h1>🔄 Token Exchange - 令牌交换</h1>
 <div class="info">
 <p><strong>RFC 8693:</strong> 用于在不同安全域之间交换令牌，实现令牌降级、委托等场景。</p>
+<p>%s</p>
+<p><strong>注意:</strong> 须使用授权码/设备流等<strong>用户委托</strong>令牌；<code>scope</code> 须为 subject 的子集（勿填 <code>all</code>）。</p>
 </div>
 <form method="POST">
 <div class="form-group">
-<label>Subject Token (留空则使用当前会话Token)</label>
+<label>Subject Token (留空则使用当前用户会话)</label>
 <textarea name="subject_token" placeholder="eyJhbGciOiJIUzI1NiIs...">%s</textarea>
 </div>
 <div class="form-group">
@@ -2117,7 +2249,7 @@ h1 { color: #1e293b; }
 <a href="/" style="color:#64748b">返回首页</a>
 </div>
 </body>
-</html>`, currentToken)
+</html>`, currentHint, currentToken)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(html))
 }

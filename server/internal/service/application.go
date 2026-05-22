@@ -25,7 +25,10 @@ var (
  * 功能：OAuth2 应用的创建、更新、删除、密钥重置和统计查询
  */
 type ApplicationService struct {
-	appRepo *repository.ApplicationRepository
+	appRepo      *repository.ApplicationRepository
+	oauthRepo    *repository.OAuthRepository
+	webhookRepo  *repository.WebhookRepository
+	userAuthRepo *repository.UserAuthorizationRepository
 }
 
 /*
@@ -36,14 +39,24 @@ func NewApplicationService(appRepo *repository.ApplicationRepository) *Applicati
 	return &ApplicationService{appRepo: appRepo}
 }
 
+/* SetCleanupRepos 注入应用删除所需的级联清理仓储 */
+func (s *ApplicationService) SetCleanupRepos(oauthRepo *repository.OAuthRepository, webhookRepo *repository.WebhookRepository, userAuthRepo *repository.UserAuthorizationRepository) {
+	s.oauthRepo = oauthRepo
+	s.webhookRepo = webhookRepo
+	s.userAuthRepo = userAuthRepo
+}
+
 /* CreateAppInput 创建应用的输入参数 */
 type CreateAppInput struct {
-	Name         string
-	Description  string
-	RedirectURIs []string
-	Scopes       []string
-	GrantTypes   []string
-	UserID       uuid.UUID
+	Name                    string
+	Description             string
+	RedirectURIs            []string
+	Scopes                  []string
+	AllowedScopes           []string
+	GrantTypes              []string
+	AppType                 string
+	TokenEndpointAuthMethod string
+	UserID                  uuid.UUID
 }
 
 /*
@@ -57,15 +70,37 @@ func (s *ApplicationService) CreateApp(input *CreateAppInput) (*model.Applicatio
 		Name:        input.Name,
 		Description: input.Description,
 		UserID:      input.UserID,
+		AppType:     model.AppTypeConfidential,
+		TokenEndpointAuthMethod: model.AuthMethodClientSecretBasic,
+	}
+	if input.AppType != "" {
+		app.AppType = model.ApplicationType(input.AppType)
+	}
+	if input.TokenEndpointAuthMethod != "" {
+		app.TokenEndpointAuthMethod = model.TokenEndpointAuthMethod(input.TokenEndpointAuthMethod)
 	}
 	app.SetRedirectURIs(input.RedirectURIs)
-	app.SetScopes(input.Scopes)
+	scopes := input.Scopes
+	if len(scopes) == 0 {
+		scopes = model.DefaultUserAuthorizationScopes()
+	}
+	app.SetScopes(scopes)
 
 	// Set grant types (default to authorization_code and refresh_token if not specified)
 	if len(input.GrantTypes) > 0 {
 		app.SetGrantTypes(input.GrantTypes)
 	} else {
 		app.SetGrantTypes([]string{"authorization_code", "refresh_token"})
+	}
+	if len(input.AllowedScopes) > 0 {
+		app.SetAllowedScopes(input.AllowedScopes)
+	} else {
+		for _, gt := range app.GetGrantTypes() {
+			if gt == "client_credentials" {
+				app.SetAllowedScopes(model.DefaultMachineScopes())
+				break
+			}
+		}
 	}
 
 	if err := s.appRepo.Create(app); err != nil {
@@ -101,13 +136,16 @@ func (s *ApplicationService) GetUserApps(userID uuid.UUID) ([]model.Application,
 
 /* UpdateAppInput 更新应用的输入参数 */
 type UpdateAppInput struct {
-	ID           uuid.UUID
-	Name         string
-	Description  string
-	RedirectURIs []string
-	Scopes       []string
-	GrantTypes   []string
-	UserID       uuid.UUID // For ownership verification
+	ID                      uuid.UUID
+	Name                    string
+	Description             string
+	RedirectURIs            []string
+	Scopes                  []string
+	AllowedScopes           []string
+	GrantTypes              []string
+	AppType                 string
+	TokenEndpointAuthMethod string
+	UserID                  uuid.UUID // For ownership verification
 }
 
 /*
@@ -140,8 +178,23 @@ func (s *ApplicationService) UpdateApp(input *UpdateAppInput) (*model.Applicatio
 	if len(input.Scopes) > 0 {
 		app.SetScopes(input.Scopes)
 	}
+	if len(input.AllowedScopes) > 0 {
+		app.SetAllowedScopes(input.AllowedScopes)
+	}
 	if len(input.GrantTypes) > 0 {
 		app.SetGrantTypes(input.GrantTypes)
+		for _, gt := range input.GrantTypes {
+			if gt == "client_credentials" && len(app.GetAllowedScopes()) == 0 {
+				app.SetAllowedScopes(model.DefaultMachineScopes())
+				break
+			}
+		}
+	}
+	if input.AppType != "" {
+		app.AppType = model.ApplicationType(input.AppType)
+	}
+	if input.TokenEndpointAuthMethod != "" {
+		app.TokenEndpointAuthMethod = model.TokenEndpointAuthMethod(input.TokenEndpointAuthMethod)
 	}
 
 	if err := s.appRepo.Update(app); err != nil {
@@ -153,7 +206,7 @@ func (s *ApplicationService) UpdateApp(input *UpdateAppInput) (*model.Applicatio
 
 /*
  * DeleteApp 删除应用
- * 功能：校验所有权后删除应用
+ * 功能：校验所有权后删除应用，并级联清理授权记录、OAuth 凭证和 Webhook
  * @param id     - 应用 UUID
  * @param userID - 当前用户 UUID（用于所有权校验）
  */
@@ -166,6 +219,22 @@ func (s *ApplicationService) DeleteApp(id, userID uuid.UUID) error {
 	// Verify ownership
 	if app.UserID != userID {
 		return ErrNotAppOwner
+	}
+
+	if s.userAuthRepo != nil {
+		if _, err := s.userAuthRepo.DeleteByApp(app.ID); err != nil {
+			return err
+		}
+	}
+	if s.webhookRepo != nil {
+		if err := s.webhookRepo.DeleteByAppID(app.ID); err != nil {
+			return err
+		}
+	}
+	if s.oauthRepo != nil {
+		if err := s.oauthRepo.DeleteTokensByClientID(app.ClientID); err != nil {
+			return err
+		}
 	}
 
 	return s.appRepo.Delete(id)
@@ -235,4 +304,28 @@ func (s *ApplicationService) GetAppStats(id, userID uuid.UUID) (*AppStats, error
 		TotalUsers:          stats.TotalUsers,
 		Last24hTokens:       stats.Last24hTokens,
 	}, nil
+}
+
+/*
+ * ListAuthorizedUsers 分页查询应用的授权用户（含用户资料预加载）
+ */
+func (s *ApplicationService) ListAuthorizedUsers(id, ownerID uuid.UUID, page, limit int) ([]model.UserAuthorization, int64, error) {
+	app, err := s.appRepo.FindByID(id)
+	if err != nil {
+		return nil, 0, ErrAppNotFound
+	}
+	if app.UserID != ownerID {
+		return nil, 0, ErrNotAppOwner
+	}
+	if s.userAuthRepo == nil {
+		return []model.UserAuthorization{}, 0, nil
+	}
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	offset := (page - 1) * limit
+	return s.userAuthRepo.FindByApp(id, offset, limit)
 }

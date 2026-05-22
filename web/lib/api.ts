@@ -472,11 +472,58 @@ class ApiClient {
     return this.request(`/api/apps/${id}/stats`);
   }
 
+  async getAppAuthorizedUsers(id: string, page = 1, limit = 20): Promise<ApiResponse<{
+    authorizations: UserAuthorization[];
+    total: number;
+    page: number;
+    limit: number;
+  }>> {
+    return this.request(`/api/apps/${id}/users?page=${page}&limit=${limit}`);
+  }
+
   // OAuth endpoints
-  async getOAuthAppInfo(clientId: string, redirectUri?: string): Promise<ApiResponse<{ app: { id: string; name: string; description: string } }>> {
+  async getOAuthAppInfo(
+    clientId: string,
+    redirectUri?: string,
+    scope?: string,
+    responseType?: string
+  ): Promise<ApiResponse<{
+    app: {
+      id: string;
+      name: string;
+      description: string;
+      client_id?: string;
+      scopes?: string[];
+      allowed_scopes?: string[];
+      grant_types?: string[];
+      issued_token_types?: string[];
+      response_types_supported?: string[];
+    };
+    requested_scopes?: string[];
+    invalid_scopes?: string[];
+    effective_scope?: string;
+    has_openid?: boolean;
+    issued_token_types?: string[];
+  }>> {
     const params = new URLSearchParams({ client_id: clientId });
     if (redirectUri) params.set('redirect_uri', redirectUri);
-    return this.request<{ app: { id: string; name: string; description: string } }>(`/api/oauth/app-info?${params.toString()}`);
+    if (scope) params.set('scope', scope);
+    if (responseType) params.set('response_type', responseType);
+    return this.request(`/api/oauth/app-info?${params.toString()}`);
+  }
+
+  async getOAuthAuthorizePending(params: {
+    client_id: string;
+    redirect_uri: string;
+    scope?: string;
+    state?: string;
+    code_challenge?: string;
+  }): Promise<ApiResponse<{ pending: boolean; redirect_url?: string; reused?: boolean }>> {
+    const q = new URLSearchParams({ client_id: params.client_id, redirect_uri: params.redirect_uri });
+    if (params.scope) q.set('scope', params.scope);
+    if (params.state) q.set('state', params.state);
+    if (params.code_challenge) q.set('code_challenge', params.code_challenge);
+    return this.request(`/api/oauth/authorize/pending?${q.toString()}`);
   }
 
   async submitOAuthAuthorize(data: {
@@ -488,8 +535,19 @@ class ApiClient {
     code_challenge?: string;
     code_challenge_method?: string;
     consent: 'allow' | 'deny';
-  }): Promise<ApiResponse<{ redirect_url: string; code?: string; state?: string }>> {
-    return this.request<{ redirect_url: string; code?: string; state?: string }>('/api/oauth/authorize', {
+  }): Promise<ApiResponse<{
+    redirect_url: string;
+    code?: string;
+    state?: string;
+    authorization?: {
+      scope: string;
+      scopes: string[];
+      issued_token_types?: string[];
+      user?: { id: string; username: string; email: string };
+      app?: { id: string; client_id: string; name: string };
+    };
+  }>> {
+    return this.request('/api/oauth/authorize', {
       method: 'POST',
       body: JSON.stringify(data),
     });
@@ -544,7 +602,7 @@ class ApiClient {
   }
 
   /* 管理员：更新用户状态（停用/启用） */
-  async updateUserStatus(id: string, status: 'active' | 'suspended' | 'pending'): Promise<ApiResponse<{ message: string }>> {
+  async updateUserStatus(id: string, status: 'active' | 'disabled' | 'suspended' | 'pending'): Promise<ApiResponse<{ message: string }>> {
     return this.request<{ message: string }>(`/api/admin/users/${id}/status`, {
       method: 'POST',
       body: JSON.stringify({ status }),
@@ -753,8 +811,24 @@ class ApiClient {
   }
 
   // Device Flow endpoints
-  async getDeviceInfo(userCode: string): Promise<{ user_code: string; scope: string; app: { id: string; name: string; description: string }; expires_in: number }> {
-    const response = await this.request<{ user_code: string; scope: string; app: { id: string; name: string; description: string }; expires_in: number }>(
+  async getDeviceInfo(userCode: string): Promise<{
+    user_code: string;
+    scope: string;
+    scopes?: string[];
+    verification_uri?: string;
+    expires_in: number;
+    requested_scopes?: string[];
+    issued_token_types?: string[];
+    app: {
+      id: string;
+      client_id?: string;
+      name: string;
+      description: string;
+      scopes?: string[];
+      issued_token_types?: string[];
+    };
+  }> {
+    const response = await this.request(
       `/api/oauth/device/info?user_code=${encodeURIComponent(userCode)}`
     );
     if (!response.success || !response.data) {
@@ -866,12 +940,13 @@ export const api = new ApiClient();
 
 // Auth event type
 export interface AuthEvent {
-  type: 'user_registered' | 'user_login' | 'oauth_authorized' | 'oauth_revoked';
+  type: 'user_registered' | 'user_login' | 'user_updated' | 'oauth_authorized' | 'oauth_revoked' | 'token_issued' | 'token_refreshed' | 'device_authorized';
   app_id: string;
   app_name: string;
   user_id: string;
   username: string;
   email?: string;
   scope?: string;
+  grant_type?: string;
   timestamp: string;
 }

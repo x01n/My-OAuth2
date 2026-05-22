@@ -16,6 +16,7 @@ type Token struct {
 	AccessToken  string                 `json:"access_token"`            /* 访问令牌 */
 	TokenType    string                 `json:"token_type"`              /* 令牌类型，通常为 "Bearer" */
 	RefreshToken string                 `json:"refresh_token,omitempty"` /* 刷新令牌 */
+	IDToken      string                 `json:"id_token,omitempty"`      /* OpenID Connect id_token（scope 含 openid） */
 	Expiry       time.Time              `json:"expiry,omitempty"`        /* 过期时间 */
 	Scope        string                 `json:"scope,omitempty"`         /* 权限范围 */
 	Raw          map[string]interface{} `json:"-"`                       /* 原始响应数据 */
@@ -59,6 +60,7 @@ type tokenResponse struct {
 	TokenType    string `json:"token_type"`
 	ExpiresIn    int64  `json:"expires_in"`
 	RefreshToken string `json:"refresh_token"`
+	IDToken      string `json:"id_token"`
 	Scope        string `json:"scope"`
 }
 
@@ -77,6 +79,7 @@ func parseTokenResponse(data []byte) (*Token, error) {
 		AccessToken:  resp.AccessToken,
 		TokenType:    resp.TokenType,
 		RefreshToken: resp.RefreshToken,
+		IDToken:      resp.IDToken,
 		Scope:        resp.Scope,
 	}
 	token.SetExpiry(resp.ExpiresIn)

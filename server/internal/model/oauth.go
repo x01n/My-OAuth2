@@ -100,6 +100,11 @@ func (a *AccessToken) IsValid() bool {
 	return !a.IsExpired() && !a.Revoked
 }
 
+/* HasEndUser 是否绑定终端用户（client_credentials 等机器令牌为 false） */
+func (a *AccessToken) HasEndUser() bool {
+	return a.UserID != nil && *a.UserID != uuid.Nil
+}
+
 /* TableName 指定 GORM 表名为 access_tokens */
 func (AccessToken) TableName() string {
 	return "access_tokens"

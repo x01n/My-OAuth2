@@ -45,6 +45,7 @@ export default function SystemConfigPage() {
     auth_code_ttl_minutes: 10,
     access_token_ttl_hours: 1,
     refresh_token_ttl_days: 30,
+    id_token_ttl_hours: 1,
     frontend_url: '',
   });
   
@@ -90,6 +91,7 @@ export default function SystemConfigPage() {
           auth_code_ttl_minutes: response.data.oauth.auth_code_ttl_minutes,
           access_token_ttl_hours: response.data.oauth.access_token_ttl_hours,
           refresh_token_ttl_days: response.data.oauth.refresh_token_ttl_days,
+          id_token_ttl_hours: response.data.oauth.id_token_ttl_hours ?? response.data.oauth.access_token_ttl_hours,
           frontend_url: response.data.oauth.frontend_url || '',
         });
         setEmailForm({
@@ -480,6 +482,14 @@ export default function SystemConfigPage() {
                     type="number"
                     value={oauthForm.refresh_token_ttl_days}
                     onChange={(e) => setOauthForm({ ...oauthForm, refresh_token_ttl_days: parseInt(e.target.value) || 30 })}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>{t('admin.system.oauthIdTokenTTL')}</Label>
+                  <Input
+                    type="number"
+                    value={oauthForm.id_token_ttl_hours}
+                    onChange={(e) => setOauthForm({ ...oauthForm, id_token_ttl_hours: parseInt(e.target.value) || 1 })}
                   />
                 </div>
                 <div className="space-y-2">

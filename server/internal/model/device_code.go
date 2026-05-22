@@ -16,6 +16,7 @@ import (
  * @value DeviceCodeStatusAuthorized - 用户已授权
  * @value DeviceCodeStatusDenied     - 用户已拒绝
  * @value DeviceCodeStatusExpired    - 已过期
+ * @value DeviceCodeStatusConsumed   - 已兑换为 token（防止并发重复兑换）
  */
 type DeviceCodeStatus string
 
@@ -24,6 +25,7 @@ const (
 	DeviceCodeStatusAuthorized DeviceCodeStatus = "authorized"
 	DeviceCodeStatusDenied     DeviceCodeStatus = "denied"
 	DeviceCodeStatusExpired    DeviceCodeStatus = "expired"
+	DeviceCodeStatusConsumed   DeviceCodeStatus = "consumed"
 )
 
 /*

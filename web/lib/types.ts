@@ -127,8 +127,14 @@ export interface Application {
   description: string;
   redirect_uris: string[];
   scopes: string[];
+  allowed_scopes?: string[];
   grant_types: string[];
+  issued_token_types?: string[];
+  response_types_supported?: string[];
+  app_type?: string;
+  token_endpoint_auth_method?: string;
   created_at: string;
+  updated_at?: string;
 }
 
 export interface CreateAppRequest {
@@ -136,7 +142,10 @@ export interface CreateAppRequest {
   description?: string;
   redirect_uris: string[];
   scopes?: string[];
+  allowed_scopes?: string[];
   grant_types?: string[];
+  app_type?: string;
+  token_endpoint_auth_method?: string;
 }
 
 export interface UpdateAppRequest {
@@ -144,7 +153,10 @@ export interface UpdateAppRequest {
   description?: string;
   redirect_uris?: string[];
   scopes?: string[];
+  allowed_scopes?: string[];
   grant_types?: string[];
+  app_type?: string;
+  token_endpoint_auth_method?: string;
 }
 
 // OAuth types
@@ -231,19 +243,42 @@ export interface AppStats {
   last_7d_authorizations: number;
 }
 
+export interface AuthUserSummary {
+  id: string;
+  email: string;
+  username: string;
+  display_name: string;
+  avatar?: string;
+  role: string;
+  status: string;
+  email_verified: boolean;
+  last_login_at?: string;
+}
+
+export interface AuthAppSummary {
+  id: string;
+  client_id: string;
+  name: string;
+  description?: string;
+  scopes?: string[];
+  grant_types?: string[];
+}
+
 export interface UserAuthorization {
   id: string;
   user_id: string;
   app_id: string;
   scope: string;
+  scopes?: string[];
   grant_type?: string;
   authorized_at: string;
   expires_at?: string;
   revoked: boolean;
   revoked_at?: string;
-  created_at: string;
-  user?: User;
-  app?: Application;
+  is_active?: boolean;
+  created_at?: string;
+  user?: AuthUserSummary | User;
+  app?: AuthAppSummary | Application;
 }
 
 export interface DashboardStats {
@@ -367,6 +402,7 @@ export interface SystemConfig {
     auth_code_ttl_minutes: number;
     access_token_ttl_hours: number;
     refresh_token_ttl_days: number;
+    id_token_ttl_hours: number;
     frontend_url: string;
   };
   email: {

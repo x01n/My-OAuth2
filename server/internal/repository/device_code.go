@@ -100,9 +100,40 @@ func (r *DeviceCodeRepository) UpdateLastPolledAt(deviceCode string, t time.Time
 		Update("last_polled_at", t).Error
 }
 
+/**
+ * ConsumeAuthorizedDeviceCode 原子消费已授权的 device_code
+ *
+ * @description
+ *   先读取记录，再通过条件 UPDATE 把 status 从 authorized 改为 consumed。
+ *   仅当 RowsAffected==1 时调用方拿到兑换所有权；并发轮询时只有一个请求能成功，
+ *   其余请求会得到 claimed=false，避免同一个 device_code 被重复签发多对 token。
+ *
+ * @param  {string} deviceCode - 设备码字符串
+ * @returns {(*model.DeviceCode, bool, error)}
+ */
+func (r *DeviceCodeRepository) ConsumeAuthorizedDeviceCode(deviceCode string) (*model.DeviceCode, bool, error) {
+	var dc model.DeviceCode
+	if err := r.db.Where("device_code = ?", deviceCode).First(&dc).Error; err != nil {
+		return nil, false, err
+	}
+
+	res := r.db.Model(&model.DeviceCode{}).
+		Where("id = ? AND status = ?", dc.ID, model.DeviceCodeStatusAuthorized).
+		Update("status", model.DeviceCodeStatusConsumed)
+	if res.Error != nil {
+		return nil, false, res.Error
+	}
+	return &dc, res.RowsAffected == 1, nil
+}
+
 /* Delete 删除设备授权记录 */
 func (r *DeviceCodeRepository) Delete(id uuid.UUID) error {
 	return r.db.Delete(&model.DeviceCode{}, id).Error
+}
+
+/* DeleteByUserID 删除用户的所有设备授权记录 */
+func (r *DeviceCodeRepository) DeleteByUserID(userID uuid.UUID) error {
+	return r.db.Delete(&model.DeviceCode{}, "user_id = ?", userID).Error
 }
 
 /* DeleteExpired 清理所有已过期的设备授权记录 */

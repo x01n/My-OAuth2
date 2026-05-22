@@ -106,6 +106,11 @@ func (r *FederationRepository) DeleteIdentity(id uuid.UUID) error {
 	return r.db.Delete(&model.FederatedIdentity{}, "id = ?", id).Error
 }
 
+/* DeleteIdentitiesByUserID 删除用户的所有联邦身份关联 */
+func (r *FederationRepository) DeleteIdentitiesByUserID(userID uuid.UUID) error {
+	return r.db.Delete(&model.FederatedIdentity{}, "user_id = ?", userID).Error
+}
+
 /* ========== TrustedApp 受信任应用操作 ========== */
 
 /*

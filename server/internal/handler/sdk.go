@@ -120,9 +120,13 @@ func (h *SDKHandler) Register(c *gin.Context) {
 		return
 	}
 
-	// Generate tokens for the app
-	accessToken, _ := h.jwtManager.GenerateToken(user.ID, user.Email, user.Username, string(user.Role), jwt.TokenTypeAccess, 24*time.Hour)
-	refreshToken, _ := h.jwtManager.GenerateToken(user.ID, user.Email, user.Username, string(user.Role), jwt.TokenTypeRefresh, 7*24*time.Hour)
+	/*
+	 * 生成 client-scoped token（H-2 修复）：
+	 * SDK 颁发的 token 携带 ClientID claim，aud=client_id；中央 AdminOnly 中间件
+	 * 会拒绝此类 token，防止外部应用通过 SDK 获取 admin role token 进入控制台。
+	 */
+	accessToken, _ := h.jwtManager.GenerateClientToken(user.ID, user.Email, user.Username, string(user.Role), app.ClientID, jwt.TokenTypeAccess, 24*time.Hour)
+	refreshToken, _ := h.jwtManager.GenerateClientToken(user.ID, user.Email, user.Username, string(user.Role), app.ClientID, jwt.TokenTypeRefresh, 7*24*time.Hour)
 
 	// Emit SSE event
 	EmitAuthEvent(AuthEvent{
@@ -189,9 +193,9 @@ func (h *SDKHandler) Login(c *gin.Context) {
 		return
 	}
 
-	// Generate tokens for the app
-	accessToken, _ := h.jwtManager.GenerateToken(user.ID, user.Email, user.Username, string(user.Role), jwt.TokenTypeAccess, 24*time.Hour)
-	refreshToken, _ := h.jwtManager.GenerateToken(user.ID, user.Email, user.Username, string(user.Role), jwt.TokenTypeRefresh, 7*24*time.Hour)
+	/* SDK 颁发 client-scoped token：aud=client_id + ClientID claim，AdminOnly 中间件会拒绝（H-2） */
+	accessToken, _ := h.jwtManager.GenerateClientToken(user.ID, user.Email, user.Username, string(user.Role), app.ClientID, jwt.TokenTypeAccess, 24*time.Hour)
+	refreshToken, _ := h.jwtManager.GenerateClientToken(user.ID, user.Email, user.Username, string(user.Role), app.ClientID, jwt.TokenTypeRefresh, 7*24*time.Hour)
 
 	// Emit SSE event
 	EmitAuthEvent(AuthEvent{
@@ -228,17 +232,52 @@ func (h *SDKHandler) Login(c *gin.Context) {
 	Success(c, resp)
 }
 
-// SignTokenRequest represents custom token signing request
+/**
+ * SignTokenRequest 自定义 token 签发请求
+ *
+ * @description
+ *   重要安全变更（修复 0day C-1）：
+ *   - **移除** UserID 任意指定字段；服务 token 的 subject 自动绑定为 app.UserID（应用所有者）
+ *   - **限制** 仅 confidential / machine 类型应用允许使用
+ *   - **role 强制为 "service"**，不透传用户真实角色，防止越权获得 admin token
+ *   - 颁发的 token 带 audience=client_id + ClientID 字段，AdminOnly 中间件会拒绝
+ */
 type SignTokenRequest struct {
-	ClientID     string                 `json:"client_id" binding:"required"`
-	ClientSecret string                 `json:"client_secret" binding:"required"`
-	UserID       string                 `json:"user_id" binding:"required"`
-	Claims       map[string]interface{} `json:"claims"`
-	ExpiresIn    int64                  `json:"expires_in"` // seconds, default 3600
+	/** 应用 client_id */
+	ClientID string `json:"client_id" binding:"required"`
+
+	/** 应用 client_secret */
+	ClientSecret string `json:"client_secret" binding:"required"`
+
+	/** 自定义 claims（可选，仅 metadata 用途，不影响鉴权） */
+	Claims map[string]interface{} `json:"claims"`
+
+	/** 有效期（秒），默认 3600，最大 86400 */
+	ExpiresIn int64 `json:"expires_in"`
 }
 
-// SignToken signs a custom token for the application
-// POST /token/sign
+/**
+ * SignToken 为应用签发服务级 access token（M2M 场景）
+ *
+ * @route   POST /token/sign
+ * @middleware AuthRateLimiter
+ *
+ * @description
+ *   仅供应用以自己的身份获取服务级 token，用于调用受 OAuth 保护的资源 API。
+ *   不再允许任意指定 user_id（修复 C-1：任意应用 client_secret 可签发 admin token）。
+ *
+ *   颁发的 token 特征：
+ *   - Subject = app.UserID（应用所有者）
+ *   - Role    = "service"（固定，不携带 admin/user）
+ *   - aud     = client_id
+ *   - ClientID claim = client_id（AdminOnly 中间件会因此拒绝该 token）
+ *
+ *   适用条件（任一不满足直接 403）：
+ *   - app_type 必须是 confidential 或 machine
+ *   - client_secret 校验通过（ConstantTimeCompare）
+ *
+ * @security 移除 user_id 任意指定 + role 强制 service + audience 隔离
+ */
 func (h *SDKHandler) SignToken(c *gin.Context) {
 	var req SignTokenRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -246,41 +285,47 @@ func (h *SDKHandler) SignToken(c *gin.Context) {
 		return
 	}
 
-	// Validate client credentials
-	_, err := h.appRepo.ValidateCredentials(req.ClientID, req.ClientSecret)
+	/* 验证 client 凭据 */
+	app, err := h.appRepo.ValidateCredentials(req.ClientID, req.ClientSecret)
 	if err != nil {
 		Unauthorized(c, "Invalid client credentials")
 		return
 	}
 
-	// Get user
-	userID, err := model.ParseUUID(req.UserID)
-	if err != nil {
-		BadRequest(c, "Invalid user ID")
+	/* 安全要求：仅 confidential / machine 类型应用允许签发服务 token，public/SPA 不允许 */
+	if app.AppType != model.AppTypeConfidential && app.AppType != model.AppTypeMachine {
+		Forbidden(c, "Token signing is restricted to confidential or machine clients")
 		return
 	}
 
-	user, err := h.authService.GetUserByID(userID)
-	if err != nil {
-		NotFound(c, "User not found")
-		return
-	}
-
-	// Set default expiration
+	/* 默认/最大有效期 */
 	expiresIn := req.ExpiresIn
 	if expiresIn <= 0 {
 		expiresIn = 3600
 	}
-	if expiresIn > 86400*30 { // Max 30 days
-		expiresIn = 86400 * 30
+	if expiresIn > 86400 { /* 最大 1 天，比原来的 30 天大幅收紧 */
+		expiresIn = 86400
 	}
 
-	// Generate custom token
-	token, err := h.jwtManager.GenerateToken(
-		user.ID,
-		user.Email,
-		user.Username,
-		string(user.Role),
+	/*
+	 * 安全约束：
+	 * - subject 强制为 app 所有者，不接受外部传入的 user_id
+	 * - role 强制 "service"
+	 * - audience = client_id，并写入 ClientID claim
+	 *   → 中央 AdminOnly 中间件会拒绝该 token，防止任意签发 admin token 提权
+	 */
+	owner, err := h.authService.GetUserByID(app.UserID)
+	if err != nil {
+		InternalError(c, "App owner not found")
+		return
+	}
+
+	token, err := h.jwtManager.GenerateClientToken(
+		owner.ID,
+		owner.Email,
+		owner.Username,
+		"service", /* 强制 role */
+		app.ClientID,
 		jwt.TokenTypeAccess,
 		time.Duration(expiresIn)*time.Second,
 	)
@@ -293,6 +338,8 @@ func (h *SDKHandler) SignToken(c *gin.Context) {
 		"token":      token,
 		"token_type": "Bearer",
 		"expires_in": expiresIn,
+		"scope":      "service",
+		"client_id":  app.ClientID,
 	})
 }
 
@@ -650,8 +697,21 @@ type SDKRefreshRequest struct {
 	RefreshToken string `json:"refresh_token" binding:"required"`
 }
 
-// RefreshToken 使用 refresh token 换取新的 token 对
-// POST /api/sdk/refresh
+/**
+ * RefreshToken 使用 refresh token 换取新的 token 对
+ *
+ * @route   POST /api/sdk/refresh
+ *
+ * @description
+ *   SDK 专用 refresh 端点。安全检查：
+ *   1. 验证 client_id + client_secret
+ *   2. **H-1 修复**：解析旧 refresh token 的 ClientID claim，必须与请求的 client_id 一致
+ *      — 防止 App A 使用 App B 签发的 refresh token 跨客户端刷新
+ *   3. 通过 AuthService.RefreshTokens() 执行 Token Rotation（单次使用 + 重放检测）
+ *   4. 新 token 使用 GenerateClientToken 签发，保持 audience 隔离
+ *
+ * @security H-1 修复：跨客户端 refresh token 检查 + 新 token 保持 client-scoped
+ */
 func (h *SDKHandler) RefreshToken(c *gin.Context) {
 	var req SDKRefreshRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -659,25 +719,57 @@ func (h *SDKHandler) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	// 验证应用凭据
-	_, err := h.appRepo.ValidateCredentials(req.ClientID, req.ClientSecret)
+	app, err := h.appRepo.ValidateCredentials(req.ClientID, req.ClientSecret)
 	if err != nil {
 		Unauthorized(c, "Invalid client credentials")
 		return
 	}
 
-	// 刷新 token（复用 AuthService 的 Token Rotation 逻辑）
-	tokens, err := h.authService.RefreshTokens(req.RefreshToken)
-	if err != nil {
+	/*
+	 * H-1 修复：跨客户端 refresh token 检查
+	 * 解析旧 refresh token 中的 ClientID claim，确认与当前请求的 client_id 一致。
+	 * 不一致则拒绝（可能是 App A 窃取了 App B 的 refresh token）。
+	 */
+	oldClaims, parseErr := h.jwtManager.ValidateRefreshToken(req.RefreshToken)
+	if parseErr != nil {
+		Unauthorized(c, "Invalid or expired refresh token")
+		return
+	}
+	if oldClaims.ClientID != req.ClientID {
+		Forbidden(c, "Refresh token was not issued to this client")
+		return
+	}
+
+	if _, err := h.authService.RefreshTokens(req.RefreshToken); err != nil {
 		Unauthorized(c, "Invalid or expired refresh token")
 		return
 	}
 
+	/*
+	 * 重新签发 client-scoped token：
+	 * AuthService.RefreshTokens 返回的是中央 token（无 ClientID），
+	 * SDK 场景需要覆盖为 client-scoped token 以保持 audience 隔离。
+	 */
+	user, userErr := h.authService.GetUserByID(oldClaims.UserID)
+	if userErr != nil {
+		InternalError(c, "User not found")
+		return
+	}
+
+	accessToken, _ := h.jwtManager.GenerateClientToken(
+		user.ID, user.Email, user.Username, string(user.Role),
+		app.ClientID, jwt.TokenTypeAccess, 24*time.Hour,
+	)
+	refreshToken, _ := h.jwtManager.GenerateClientToken(
+		user.ID, user.Email, user.Username, string(user.Role),
+		app.ClientID, jwt.TokenTypeRefresh, 7*24*time.Hour,
+	)
+
 	Success(c, gin.H{
-		"access_token":  tokens.AccessToken,
-		"refresh_token": tokens.RefreshToken,
-		"token_type":    tokens.TokenType,
-		"expires_in":    tokens.ExpiresIn,
+		"access_token":  accessToken,
+		"refresh_token": refreshToken,
+		"token_type":    "Bearer",
+		"expires_in":    86400,
 	})
 }
 

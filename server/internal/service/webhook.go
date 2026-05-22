@@ -27,6 +27,8 @@ import (
 var (
 	ErrWebhookURLInvalid  = errors.New("webhook URL must be a valid HTTP or HTTPS URL")
 	ErrWebhookURLInsecure = errors.New("webhook URL must use HTTPS in production")
+	ErrWebhookURLInternal = errors.New("webhook URL must not point to internal network addresses")
+	ErrWebhookNotFound    = errors.New("webhook not found")
 )
 
 /*
@@ -34,18 +36,20 @@ var (
  * 功能：管理 Webhook 配置、触发事件回调、异步投递、失败重试和 HMAC-SHA256 签名
  */
 type WebhookService struct {
-	webhookRepo *repository.WebhookRepository
-	httpClient  *http.Client
-	log         *logger.Logger
+	webhookRepo      *repository.WebhookRepository
+	httpClient       *http.Client
+	log              *logger.Logger
+	allowLocalhost   bool // debug 模式下允许 localhost 回调（本地 Webhook 测试）
 }
 
 /*
  * NewWebhookService 创建 Webhook 服务实例
  * @param webhookRepo - Webhook 数据仓储
  */
-func NewWebhookService(webhookRepo *repository.WebhookRepository) *WebhookService {
+func NewWebhookService(webhookRepo *repository.WebhookRepository, allowLocalhost bool) *WebhookService {
 	return &WebhookService{
-		webhookRepo: webhookRepo,
+		webhookRepo:    webhookRepo,
+		allowLocalhost: allowLocalhost,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
@@ -69,7 +73,7 @@ func NewWebhookService(webhookRepo *repository.WebhookRepository) *WebhookServic
  */
 func (s *WebhookService) CreateWebhook(appID uuid.UUID, webhookURL, secret, events string) (*model.Webhook, error) {
 	/* 校验 Webhook URL 安全性 */
-	if err := validateWebhookURL(webhookURL); err != nil {
+	if err := validateWebhookURL(webhookURL, s.allowLocalhost); err != nil {
 		return nil, err
 	}
 
@@ -93,7 +97,7 @@ func (s *WebhookService) CreateWebhook(appID uuid.UUID, webhookURL, secret, even
  * 规则：仅允许 http/https 协议，阻止 javascript:/data: 等危险协议
  *       生产环境建议仅允许 HTTPS
  */
-func validateWebhookURL(rawURL string) error {
+func validateWebhookURL(rawURL string, allowLocalhost bool) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return ErrWebhookURLInvalid
@@ -112,11 +116,17 @@ func validateWebhookURL(rawURL string) error {
 	}
 	/* 先检查主机名（localhost 等无法 IP 解析） */
 	if strings.EqualFold(host, "localhost") {
-		return errors.New("webhook URL must not point to internal network addresses")
+		if allowLocalhost {
+			return nil
+		}
+		return ErrWebhookURLInternal
 	}
 	ip := net.ParseIP(host)
 	if ip != nil && isPrivateIP(ip) {
-		return errors.New("webhook URL must not point to internal network addresses")
+		if allowLocalhost && (ip.IsLoopback() || ip.IsPrivate()) {
+			return nil
+		}
+		return ErrWebhookURLInternal
 	}
 	return nil
 }
@@ -158,7 +168,7 @@ func (s *WebhookService) GetWebhooks(appID uuid.UUID) ([]model.Webhook, error) {
  */
 func (s *WebhookService) UpdateWebhook(id uuid.UUID, webhookURL, secret, events string, active bool) error {
 	/* 校验新 URL 安全性 */
-	if err := validateWebhookURL(webhookURL); err != nil {
+	if err := validateWebhookURL(webhookURL, s.allowLocalhost); err != nil {
 		return err
 	}
 
@@ -177,9 +187,18 @@ func (s *WebhookService) UpdateWebhook(id uuid.UUID, webhookURL, secret, events 
 	return s.webhookRepo.Update(webhook)
 }
 
-/* DeleteWebhook 删除 Webhook */
-func (s *WebhookService) DeleteWebhook(id uuid.UUID) error {
-	return s.webhookRepo.Delete(id)
+/*
+ * DeleteWebhookForApp 删除指定应用下的 Webhook（先校验归属，再级联删除投递记录）
+ */
+func (s *WebhookService) DeleteWebhookForApp(appID, webhookID uuid.UUID) error {
+	webhook, err := s.webhookRepo.FindByID(webhookID)
+	if err != nil {
+		return ErrWebhookNotFound
+	}
+	if webhook.AppID != appID {
+		return ErrWebhookNotFound
+	}
+	return s.webhookRepo.Delete(webhookID)
 }
 
 /*

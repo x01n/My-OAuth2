@@ -6,18 +6,21 @@ import (
 	"sync"
 	"time"
 
+	gctx "server/internal/context"
+
 	"github.com/gin-gonic/gin"
 )
 
 /* AuthEvent 授权事件结构（SSE 推送给客户端的事件数据） */
 type AuthEvent struct {
-	Type      string    `json:"type"` // user_registered, user_login, oauth_authorized, oauth_revoked
+	Type      string    `json:"type"` // user_registered, user_login, oauth_authorized, device_authorized, token_issued, ...
 	AppID     string    `json:"app_id"`
 	AppName   string    `json:"app_name"`
 	UserID    string    `json:"user_id"`
 	Username  string    `json:"username"`
 	Email     string    `json:"email,omitempty"`
 	Scope     string    `json:"scope,omitempty"`
+	GrantType string    `json:"grant_type,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -118,8 +121,7 @@ func (h *SSEHandler) Stream(c *gin.Context) {
 	hub := GetSSEHub()
 
 	// Get client info from context (set by auth middleware)
-	userID, _ := c.Get("user_id")
-	userRole, _ := c.Get("user_role")
+	userID, _ := gctx.GetUserID(c)
 
 	// Get optional app filter
 	appID := c.Query("app_id")
@@ -127,8 +129,8 @@ func (h *SSEHandler) Stream(c *gin.Context) {
 	client := &SSEClient{
 		ID:       fmt.Sprintf("%d", time.Now().UnixNano()),
 		AppID:    appID,
-		UserID:   fmt.Sprintf("%v", userID),
-		IsAdmin:  userRole == "admin",
+		UserID:   userID.String(),
+		IsAdmin:  gctx.IsAdmin(c),
 		Messages: make(chan AuthEvent, 10),
 	}
 

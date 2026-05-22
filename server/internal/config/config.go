@@ -91,10 +91,12 @@ type OAuthConfig struct {
 	AuthCodeTTLMin      int           `json:"auth_code_ttl_minutes"`
 	AccessTokenTTLHours int           `json:"access_token_ttl_hours"`
 	RefreshTokenTTLDays int           `json:"refresh_token_ttl_days"`
+	IDTokenTTLHours     int           `json:"id_token_ttl_hours"`
 	FrontendURL         string        `json:"frontend_url"`
 	AuthCodeTTL         time.Duration `json:"-"`
 	AccessTokenTTL      time.Duration `json:"-"`
 	RefreshTokenTTL     time.Duration `json:"-"`
+	IDTokenTTL          time.Duration `json:"-"`
 }
 
 type EmailConfig struct {
@@ -278,6 +280,7 @@ func defaultConfig() *Config {
 			AuthCodeTTLMin:      10,
 			AccessTokenTTLHours: 1,
 			RefreshTokenTTLDays: 30,
+			IDTokenTTLHours:     1,
 			FrontendURL:         "",
 		},
 		Email: EmailConfig{
@@ -325,6 +328,10 @@ func (c *Config) computeDurations() {
 	c.OAuth.AuthCodeTTL = time.Duration(c.OAuth.AuthCodeTTLMin) * time.Minute
 	c.OAuth.AccessTokenTTL = time.Duration(c.OAuth.AccessTokenTTLHours) * time.Hour
 	c.OAuth.RefreshTokenTTL = time.Duration(c.OAuth.RefreshTokenTTLDays) * 24 * time.Hour
+	if c.OAuth.IDTokenTTLHours <= 0 {
+		c.OAuth.IDTokenTTLHours = c.OAuth.AccessTokenTTLHours
+	}
+	c.OAuth.IDTokenTTL = time.Duration(c.OAuth.IDTokenTTLHours) * time.Hour
 }
 
 /*

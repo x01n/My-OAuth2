@@ -15,13 +15,28 @@ import (
 	"github.com/google/uuid"
 )
 
-/* 认证服务层错误定义 */
+/**
+ * 认证服务层错误定义
+ * @enum {error}
+ */
 var (
+	/** 邮箱或密码错误 / 用户被禁用 */
 	ErrInvalidCredentials = errors.New("invalid credentials")
-	ErrEmailExists        = errors.New("email already exists")
-	ErrUsernameExists     = errors.New("username already exists")
-	ErrPasswordTooWeak    = errors.New("password does not meet strength requirements")
-	ErrAccountLocked      = errors.New("account temporarily locked due to too many failed attempts")
+
+	/** 邮箱已被注册 */
+	ErrEmailExists = errors.New("email already exists")
+
+	/** 用户名已被占用 */
+	ErrUsernameExists = errors.New("username already exists")
+
+	/** 密码不满足强度要求 */
+	ErrPasswordTooWeak = errors.New("password does not meet strength requirements")
+
+	/** 账户因连续失败被临时锁定 */
+	ErrAccountLocked = errors.New("account temporarily locked due to too many failed attempts")
+
+	/** 用户被管理员禁用（disabled/suspended） */
+	ErrUserDisabled = errors.New("user account is disabled")
 )
 
 /*
@@ -30,12 +45,18 @@ var (
  *       支持 Refresh Token Rotation 安全机制
  */
 type AuthService struct {
-	userRepo       *repository.UserRepository
-	loginLogRepo   *repository.LoginLogRepository
-	oauthRepo      *repository.OAuthRepository
-	jwtManager     *jwt.Manager
-	config         *config.Config
-	tokenBlacklist *jwt.Blacklist
+	userRepo               *repository.UserRepository
+	loginLogRepo           *repository.LoginLogRepository
+	oauthRepo              *repository.OAuthRepository
+	jwtManager             *jwt.Manager
+	config                 *config.Config
+	tokenBlacklist         *jwt.Blacklist
+	appRepo                *repository.ApplicationRepository
+	userAuthRepo           *repository.UserAuthorizationRepository
+	federationRepo         *repository.FederationRepository
+	deviceCodeRepo         *repository.DeviceCodeRepository
+	passwordResetRepo      *repository.PasswordResetRepository
+	emailVerificationRepo  *repository.EmailVerificationRepository
 }
 
 /*
@@ -64,6 +85,23 @@ func (s *AuthService) SetTokenBlacklist(bl *jwt.Blacklist) {
 	s.tokenBlacklist = bl
 }
 
+/* SetCleanupRepos 注入账号删除所需的级联清理仓储 */
+func (s *AuthService) SetCleanupRepos(
+	appRepo *repository.ApplicationRepository,
+	userAuthRepo *repository.UserAuthorizationRepository,
+	federationRepo *repository.FederationRepository,
+	deviceCodeRepo *repository.DeviceCodeRepository,
+	passwordResetRepo *repository.PasswordResetRepository,
+	emailVerificationRepo *repository.EmailVerificationRepository,
+) {
+	s.appRepo = appRepo
+	s.userAuthRepo = userAuthRepo
+	s.federationRepo = federationRepo
+	s.deviceCodeRepo = deviceCodeRepo
+	s.passwordResetRepo = passwordResetRepo
+	s.emailVerificationRepo = emailVerificationRepo
+}
+
 /* GetJWTManager 返回 JWT 管理器（用于 Logout 等场景解析 token） */
 func (s *AuthService) GetJWTManager() *jwt.Manager {
 	return s.jwtManager
@@ -84,10 +122,11 @@ type LoginInput struct {
 	UserAgent string
 }
 
-/* AuthTokens 认证令牌对（access_token + refresh_token） */
+/* AuthTokens 登录/OAuth 用户委托令牌（access + refresh + id_token，均为加密 JWT） */
 type AuthTokens struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+	IDToken      string `json:"id_token,omitempty"`
 	TokenType    string `json:"token_type"`
 	ExpiresIn    int64  `json:"expires_in"`
 }
@@ -226,6 +265,17 @@ func (s *AuthService) Login(input *LoginInput) (*model.User, *AuthTokens, error)
 		needsUpdate = true
 	}
 
+	/*
+	 * L-8 修复：写入最后登录时间与 IP，供个人中心 / 管理后台展示
+	 * 用 UTC 时间避免跨时区比较毛刺（L-13）
+	 */
+	now := time.Now().UTC()
+	user.LastLoginAt = &now
+	if input.IPAddress != "" {
+		user.LastLoginIP = input.IPAddress
+	}
+	needsUpdate = true
+
 	/* bcrypt cost 自适应升级：旧哈希使用较低 cost 时透明重哈希 */
 	if password.NeedsRehash(user.PasswordHash) {
 		if newHash, hashErr := password.Hash(input.Password); hashErr == nil {
@@ -253,10 +303,18 @@ func (s *AuthService) Login(input *LoginInput) (*model.User, *AuthTokens, error)
 	return user, tokens, nil
 }
 
-/*
- * RefreshTokens 使用 refresh token 生成新的 token 对
- * 实现 Token Rotation：每个 refresh token 只能使用一次，
- * 使用后立即失效并颁发新的 refresh token
+/**
+ * RefreshTokens 使用 refresh token 生成新的 token 对（Rotation 模式）
+ *
+ * @description
+ *   单次使用语义 — 旧 refresh token 立即作废；超过宽限期重复使用视为重放，
+ *   撤销该用户全部 refresh token。**禁用用户的刷新请求会被直接拒绝，
+ *   并主动撤销其所有现存 token**（修复"禁用用户能继续刷新"漏洞）。
+ *
+ * @param  {string} refreshToken - 旧 refresh token
+ * @returns {*AuthTokens, error}  新 token 对；失败返回错误
+ * @throws  {ErrUserDisabled}    用户已被管理员禁用
+ * @security 禁用用户：拒绝刷新 + 黑名单全部已签发 access token
  */
 func (s *AuthService) RefreshTokens(refreshToken string) (*AuthTokens, error) {
 	/* 验证 refresh token 且确保类型正确 */
@@ -298,19 +356,34 @@ func (s *AuthService) RefreshTokens(refreshToken string) (*AuthTokens, error) {
 		return nil, err
 	}
 
+	/*
+	 * 用户状态实时校验：禁用用户拒绝刷新（C-1 相关 + 用户禁用需求）
+	 * 安全策略：检测到禁用用户的刷新请求时，主动撤销其所有现存 token，
+	 * 防止已在客户端持有的 access token 继续被使用至过期。
+	 */
+	if user.IsSuspended() || user.Status == "disabled" {
+		if s.oauthRepo != nil {
+			_ = s.oauthRepo.RevokeUserAuthRefreshTokens(user.ID)
+		}
+		if s.tokenBlacklist != nil {
+			_ = s.tokenBlacklist.RevokeAllForUser(user.ID.String(), s.config.JWT.AccessTokenTTL)
+		}
+		return nil, ErrUserDisabled
+	}
+
 	return s.generateTokens(user)
 }
 
 /*
- * LogoutUser 用户登出时撤销该用户所有 Auth Refresh Token
- * 功能：确保服务端彻底失效，即使 Cookie 被截获也无法再刷新
+ * LogoutUser 用户登出时撤销该用户所有令牌
+ * 功能：Auth refresh（Dashboard JWT）+ OAuth 不透明令牌（授权码/设备流/令牌交换）一并失效
  * @param userID - 用户 UUID
  */
 func (s *AuthService) LogoutUser(userID uuid.UUID) {
 	if s.oauthRepo != nil {
 		_ = s.oauthRepo.RevokeUserAuthRefreshTokens(userID)
+		_ = s.oauthRepo.RevokeTokensByUserID(userID)
 	}
-	/* 吊销该用户所有已签发的 access token（基于用户级别时间戳） */
 	if s.tokenBlacklist != nil {
 		_ = s.tokenBlacklist.RevokeAllForUser(userID.String(), s.config.JWT.AccessTokenTTL)
 	}
@@ -374,9 +447,22 @@ func (s *AuthService) generateTokens(user *model.User) (*AuthTokens, error) {
 		}
 	}
 
+	loginScope := "openid profile email"
+	idTTL := s.config.OAuth.IDTokenTTL
+	if idTTL <= 0 {
+		idTTL = s.config.JWT.AccessTokenTTL
+	}
+	idToken, err := s.jwtManager.GenerateIDToken(
+		user.ID, user.Email, user.Username, string(user.Role), "", loginScope, idTTL,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &AuthTokens{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
+		IDToken:      idToken,
 		TokenType:    "Bearer",
 		ExpiresIn:    int64(s.config.JWT.AccessTokenTTL.Seconds()),
 	}, nil
@@ -453,6 +539,11 @@ func (s *AuthService) ChangePassword(userID uuid.UUID, oldPassword, newPassword 
 		return err
 	}
 
+	/* 密码修改后使历史 password reset token 失效，防止旧邮件链接继续可用 */
+	if s.passwordResetRepo != nil {
+		_ = s.passwordResetRepo.InvalidateUserTokens(userID)
+	}
+
 	/* 密码修改后撤销该用户所有 auth refresh token，强制其他会话重新登录 */
 	if s.oauthRepo != nil {
 		_ = s.oauthRepo.RevokeUserAuthRefreshTokens(userID)
@@ -466,7 +557,7 @@ func (s *AuthService) ChangePassword(userID uuid.UUID, oldPassword, newPassword 
 
 /*
  * DeleteAccount 用户自助删除账号 (GDPR 合规)
- * 功能：验证密码后永久删除用户数据，撤销所有 token 和授权
+ * 功能：验证密码后永久删除用户数据，撤销所有 token、授权、联邦身份和归属应用
  * @param userID   - 用户 UUID
  * @param password - 当前密码（社交登录用户可为空）
  */
@@ -489,11 +580,46 @@ func (s *AuthService) DeleteAccount(userID uuid.UUID, pwd string) error {
 	/* 撤销所有 refresh token */
 	if s.oauthRepo != nil {
 		_ = s.oauthRepo.RevokeUserAuthRefreshTokens(userID)
+		_ = s.oauthRepo.RevokeTokensByUserID(userID)
 	}
 
 	/* 吊销所有 access token（JWT 黑名单） */
 	if s.tokenBlacklist != nil {
 		_ = s.tokenBlacklist.RevokeAllForUser(userID.String(), s.config.JWT.AccessTokenTTL)
+	}
+
+	/* 删除用户作为 owner 创建的所有应用（连带清理 app 相关授权、token、webhook） */
+	if s.appRepo != nil {
+		if apps, appErr := s.appRepo.FindByUserID(userID); appErr == nil {
+			for _, app := range apps {
+				if s.userAuthRepo != nil {
+					_, _ = s.userAuthRepo.DeleteByApp(app.ID)
+				}
+				if s.oauthRepo != nil {
+					_ = s.oauthRepo.DeleteTokensByClientID(app.ClientID)
+				}
+				_ = s.appRepo.Delete(app.ID)
+			}
+		}
+	}
+
+	if s.userAuthRepo != nil {
+		_, _ = s.userAuthRepo.DeleteByUser(userID)
+	}
+	if s.federationRepo != nil {
+		_ = s.federationRepo.DeleteIdentitiesByUserID(userID)
+	}
+	if s.deviceCodeRepo != nil {
+		_ = s.deviceCodeRepo.DeleteByUserID(userID)
+	}
+	if s.passwordResetRepo != nil {
+		_ = s.passwordResetRepo.DeleteByUserID(userID)
+	}
+	if s.emailVerificationRepo != nil {
+		_ = s.emailVerificationRepo.DeleteByUserID(userID)
+	}
+	if s.loginLogRepo != nil {
+		_ = s.loginLogRepo.DeleteByUserID(userID)
 	}
 
 	/* 永久删除用户记录 */

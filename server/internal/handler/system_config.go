@@ -130,6 +130,7 @@ type OAuthUpdateConfig struct {
 	AuthCodeTTLMin      *int    `json:"auth_code_ttl_minutes,omitempty"`
 	AccessTokenTTLHours *int    `json:"access_token_ttl_hours,omitempty"`
 	RefreshTokenTTLDays *int    `json:"refresh_token_ttl_days,omitempty"`
+	IDTokenTTLHours     *int    `json:"id_token_ttl_hours,omitempty"`
 	FrontendURL         *string `json:"frontend_url,omitempty"`
 }
 
@@ -206,6 +207,9 @@ func (h *SystemConfigHandler) UpdateConfig(c *gin.Context) {
 		}
 		if req.OAuth.RefreshTokenTTLDays != nil {
 			h.cfg.OAuth.RefreshTokenTTLDays = *req.OAuth.RefreshTokenTTLDays
+		}
+		if req.OAuth.IDTokenTTLHours != nil {
+			h.cfg.OAuth.IDTokenTTLHours = *req.OAuth.IDTokenTTLHours
 		}
 		if req.OAuth.FrontendURL != nil {
 			h.cfg.OAuth.FrontendURL = *req.OAuth.FrontendURL

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"strconv"
 
 	ctx "server/internal/context"
 	"server/internal/service"
@@ -30,24 +31,14 @@ func NewApplicationHandler(appService *service.ApplicationService) *ApplicationH
 
 /* CreateAppRequest 创建应用请求体 */
 type CreateAppRequest struct {
-	Name         string   `json:"name" binding:"required,min=1,max=200"`
-	Description  string   `json:"description"`
-	RedirectURIs []string `json:"redirect_uris" binding:"required,min=1"`
-	Scopes       []string `json:"scopes"`
-	GrantTypes   []string `json:"grant_types"`
-}
-
-/* AppResponse 应用 API 响应结构 */
-type AppResponse struct {
-	ID           string   `json:"id"`
-	ClientID     string   `json:"client_id"`
-	ClientSecret string   `json:"client_secret,omitempty"`
-	Name         string   `json:"name"`
-	Description  string   `json:"description"`
-	RedirectURIs []string `json:"redirect_uris"`
-	Scopes       []string `json:"scopes"`
-	GrantTypes   []string `json:"grant_types"`
-	CreatedAt    string   `json:"created_at"`
+	Name                    string   `json:"name" binding:"required,min=1,max=200"`
+	Description             string   `json:"description"`
+	RedirectURIs            []string `json:"redirect_uris" binding:"required,min=1"`
+	Scopes                  []string `json:"scopes"`
+	AllowedScopes           []string `json:"allowed_scopes"`
+	GrantTypes              []string `json:"grant_types"`
+	AppType                 string   `json:"app_type"`
+	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
 }
 
 /*
@@ -72,12 +63,15 @@ func (h *ApplicationHandler) CreateApp(c *gin.Context) {
 	}
 
 	app, err := h.appService.CreateApp(&service.CreateAppInput{
-		Name:         req.Name,
-		Description:  req.Description,
-		RedirectURIs: req.RedirectURIs,
-		Scopes:       req.Scopes,
-		GrantTypes:   req.GrantTypes,
-		UserID:       userID,
+		Name:                    req.Name,
+		Description:             req.Description,
+		RedirectURIs:            req.RedirectURIs,
+		Scopes:                  req.Scopes,
+		AllowedScopes:           req.AllowedScopes,
+		GrantTypes:              req.GrantTypes,
+		AppType:                 req.AppType,
+		TokenEndpointAuthMethod: req.TokenEndpointAuthMethod,
+		UserID:                  userID,
 	})
 	if err != nil {
 		InternalError(c, "Failed to create application")
@@ -87,17 +81,7 @@ func (h *ApplicationHandler) CreateApp(c *gin.Context) {
 	audit.Log(audit.ActionAppCreate, audit.ResultSuccess, userID.String(), app.ID.String(), c.ClientIP(), "app_name", app.Name)
 
 	// Return with client_secret (only shown once)
-	Created(c, AppResponse{
-		ID:           app.ID.String(),
-		ClientID:     app.ClientID,
-		ClientSecret: app.ClientSecret,
-		Name:         app.Name,
-		Description:  app.Description,
-		RedirectURIs: app.GetRedirectURIs(),
-		Scopes:       app.GetScopes(),
-		GrantTypes:   app.GetGrantTypes(),
-		CreatedAt:    app.CreatedAt.Format("2006-01-02T15:04:05Z"),
-	})
+	Created(c, toAppResponse(app, app.ClientSecret))
 }
 
 /*
@@ -119,16 +103,7 @@ func (h *ApplicationHandler) ListApps(c *gin.Context) {
 
 	var response []AppResponse
 	for _, app := range apps {
-		response = append(response, AppResponse{
-			ID:           app.ID.String(),
-			ClientID:     app.ClientID,
-			Name:         app.Name,
-			Description:  app.Description,
-			RedirectURIs: app.GetRedirectURIs(),
-			Scopes:       app.GetScopes(),
-			GrantTypes:   app.GetGrantTypes(),
-			CreatedAt:    app.CreatedAt.Format("2006-01-02T15:04:05Z"),
-		})
+		response = append(response, toAppResponse(&app, ""))
 	}
 
 	Success(c, response)
@@ -171,25 +146,19 @@ func (h *ApplicationHandler) GetApp(c *gin.Context) {
 		return
 	}
 
-	Success(c, AppResponse{
-		ID:           app.ID.String(),
-		ClientID:     app.ClientID,
-		Name:         app.Name,
-		Description:  app.Description,
-		RedirectURIs: app.GetRedirectURIs(),
-		Scopes:       app.GetScopes(),
-		GrantTypes:   app.GetGrantTypes(),
-		CreatedAt:    app.CreatedAt.Format("2006-01-02T15:04:05Z"),
-	})
+	Success(c, toAppResponse(app, ""))
 }
 
 /* UpdateAppRequest 更新应用请求体 */
 type UpdateAppRequest struct {
-	Name         string   `json:"name"`
-	Description  string   `json:"description"`
-	RedirectURIs []string `json:"redirect_uris"`
-	Scopes       []string `json:"scopes"`
-	GrantTypes   []string `json:"grant_types"`
+	Name                    string   `json:"name"`
+	Description             string   `json:"description"`
+	RedirectURIs            []string `json:"redirect_uris"`
+	Scopes                  []string `json:"scopes"`
+	AllowedScopes           []string `json:"allowed_scopes"`
+	GrantTypes              []string `json:"grant_types"`
+	AppType                 string   `json:"app_type"`
+	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
 }
 
 /*
@@ -221,13 +190,16 @@ func (h *ApplicationHandler) UpdateApp(c *gin.Context) {
 	}
 
 	app, err := h.appService.UpdateApp(&service.UpdateAppInput{
-		ID:           id,
-		Name:         req.Name,
-		Description:  req.Description,
-		RedirectURIs: req.RedirectURIs,
-		Scopes:       req.Scopes,
-		GrantTypes:   req.GrantTypes,
-		UserID:       userID,
+		ID:                      id,
+		Name:                    req.Name,
+		Description:             req.Description,
+		RedirectURIs:            req.RedirectURIs,
+		Scopes:                  req.Scopes,
+		AllowedScopes:           req.AllowedScopes,
+		GrantTypes:              req.GrantTypes,
+		AppType:                 req.AppType,
+		TokenEndpointAuthMethod: req.TokenEndpointAuthMethod,
+		UserID:                  userID,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrAppNotFound) {
@@ -242,16 +214,7 @@ func (h *ApplicationHandler) UpdateApp(c *gin.Context) {
 		return
 	}
 
-	Success(c, AppResponse{
-		ID:           app.ID.String(),
-		ClientID:     app.ClientID,
-		Name:         app.Name,
-		Description:  app.Description,
-		RedirectURIs: app.GetRedirectURIs(),
-		Scopes:       app.GetScopes(),
-		GrantTypes:   app.GetGrantTypes(),
-		CreatedAt:    app.CreatedAt.Format("2006-01-02T15:04:05Z"),
-	})
+	Success(c, toAppResponse(app, ""))
 }
 
 /*
@@ -288,17 +251,7 @@ func (h *ApplicationHandler) ResetSecret(c *gin.Context) {
 
 	audit.Log(audit.ActionSecretReset, audit.ResultSuccess, userID.String(), app.ID.String(), c.ClientIP(), "app_name", app.Name)
 
-	Success(c, AppResponse{
-		ID:           app.ID.String(),
-		ClientID:     app.ClientID,
-		ClientSecret: newSecret,
-		Name:         app.Name,
-		Description:  app.Description,
-		RedirectURIs: app.GetRedirectURIs(),
-		Scopes:       app.GetScopes(),
-		GrantTypes:   app.GetGrantTypes(),
-		CreatedAt:    app.CreatedAt.Format("2006-01-02T15:04:05Z"),
-	})
+	Success(c, toAppResponse(app, newSecret))
 }
 
 /*
@@ -369,4 +322,47 @@ func (h *ApplicationHandler) GetAppStats(c *gin.Context) {
 	}
 
 	Success(c, stats)
+}
+
+/*
+ * GetAuthorizedUsers 获取应用的授权用户列表
+ * @route GET /api/apps/:id/users
+ */
+func (h *ApplicationHandler) GetAuthorizedUsers(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		BadRequest(c, "Invalid application ID")
+		return
+	}
+
+	userID, ok := ctx.GetUserID(c)
+	if !ok {
+		Unauthorized(c, "User not authenticated")
+		return
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+
+	auths, total, err := h.appService.ListAuthorizedUsers(id, userID, page, limit)
+	if err != nil {
+		if errors.Is(err, service.ErrAppNotFound) {
+			NotFound(c, "Application not found")
+			return
+		}
+		if errors.Is(err, service.ErrNotAppOwner) {
+			Forbidden(c, "Not the application owner")
+			return
+		}
+		InternalError(c, "Failed to fetch authorized users")
+		return
+	}
+
+	Success(c, gin.H{
+		"authorizations": toAuthorizationResponses(auths),
+		"total":          total,
+		"page":           page,
+		"limit":          limit,
+	})
 }

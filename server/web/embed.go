@@ -20,9 +20,6 @@ func GetFileSystem() http.FileSystem {
 
 // HasStaticFiles checks if static files are embedded
 func HasStaticFiles() bool {
-	entries, err := staticFiles.ReadDir("dist")
-	if err != nil {
-		return false
-	}
-	return len(entries) > 0
+	_, err := staticFiles.Open("dist/index.html")
+	return err == nil
 }

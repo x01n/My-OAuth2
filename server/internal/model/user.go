@@ -287,9 +287,9 @@ func (u *User) IsActive() bool {
 	return u.Status == "" || u.Status == "active"
 }
 
-/* IsSuspended 检查用户是否被停用 */
+/* IsSuspended 检查用户是否被停用（suspended/disabled 统一视为不可用） */
 func (u *User) IsSuspended() bool {
-	return u.Status == "suspended"
+	return u.Status == "suspended" || u.Status == "disabled"
 }
 
 /* IsLocked 检查用户账户是否被锁定（连续登录失败后的临时锁定） */

@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -63,9 +64,16 @@ func Setup(cfg *config.Config, cacheInstance cache.Cache) (*gin.Engine, func()) 
 
 	// Repositories
 	userRepo := repository.NewUserRepository(db)
-	appRepo := repository.NewApplicationRepository(db)
+
+	/*
+	 * 注入 UserRepository 到 Gin 上下文，让 Auth 中间件能实时校验用户状态（disabled/suspended 拒绝）
+	 * 必须在所有 Auth/OptionalAuth 中间件之前注册
+	 */
+	r.Use(middleware.WithUserRepo(userRepo))
+appRepo := repository.NewApplicationRepository(db)
 	oauthRepo := repository.NewOAuthRepository(db)
 	configRepo := repository.NewConfigRepository(db)
+	cachedConfigRepo := repository.NewCachedConfigRepository(configRepo, cacheInstance)
 	loginLogRepo := repository.NewLoginLogRepository(db)
 	userAuthRepo := repository.NewUserAuthorizationRepository(db)
 	webhookRepo := repository.NewWebhookRepository(db)
@@ -80,15 +88,23 @@ func Setup(cfg *config.Config, cacheInstance cache.Cache) (*gin.Engine, func()) 
 	authService := service.NewAuthService(userRepo, loginLogRepo, jwtManager, cfg)
 	authService.SetOAuthRepo(oauthRepo)           // 启用 refresh token 轮换
 	authService.SetTokenBlacklist(tokenBlacklist) // 启用 access token 即时吊销
+	authService.SetCleanupRepos(appRepo, userAuthRepo, federationRepo, deviceCodeRepo, passwordResetRepo, emailVerifyRepo)
 	appService := service.NewApplicationService(appRepo)
+	appService.SetCleanupRepos(oauthRepo, webhookRepo, userAuthRepo)
 	oauthService := service.NewOAuthService(appRepo, oauthRepo, userRepo, userAuthRepo, cfg)
+	oauthService.SetJWTManager(jwtManager)
 	oauthService.SetDeviceCodeRepository(deviceCodeRepo) // Enable device flow
-	webhookService := service.NewWebhookService(webhookRepo)
+	webhookService := service.NewWebhookService(webhookRepo, cfg.Server.Mode == "debug")
 	passwordResetService := service.NewPasswordResetService(userRepo, passwordResetRepo)
 	emailVerifyService := service.NewEmailVerificationService(userRepo, emailVerifyRepo)
-	socialAuthService := service.NewSocialAuthService(userRepo, federationRepo, loginLogRepo, jwtManager, cfg)
+	socialAuthService := service.NewSocialAuthService(userRepo, cachedFederationRepo.FederationRepository, loginLogRepo, jwtManager, cfg)
 	socialAuthService.SetOAuthRepo(oauthRepo) // 启用 refresh token 轮换
 	_ = cachedFederationRepo                  // 缓存 repo 已注册，可用于将来扩展
+
+	cacheWarmer := service.NewCacheWarmer(cacheInstance, cachedFederationRepo, cachedConfigRepo, cfg.JWT.Issuer)
+	if err := cacheWarmer.Warmup(context.Background(), cfg.Server.AllowRegistration); err != nil {
+		logger.Warn("Cache warmup failed", "error", err)
+	}
 
 	// Get frontend URL from config or use default
 	frontendURL := cfg.OAuth.FrontendURL
@@ -105,15 +121,17 @@ func Setup(cfg *config.Config, cacheInstance cache.Cache) (*gin.Engine, func()) 
 	userHandler.SetWebhookService(webhookService)
 	userHandler.SetOAuthRepo(oauthRepo, appRepo)
 	appHandler := handler.NewApplicationHandler(appService)
-	oauthHandler := handler.NewOAuthHandler(oauthService, webhookService, frontendURL)
+	baseURL := handler.BrowserReachableBaseURL(fmt.Sprintf("http://%s:%d", cfg.Server.Host, cfg.Server.Port))
+	oauthHandler := handler.NewOAuthHandler(oauthService, webhookService, frontendURL, baseURL)
 	adminHandler := handler.NewAdminHandler(userRepo, appRepo, loginLogRepo, userAuthRepo)
 	sdkHandler := handler.NewSDKHandler(authService, appRepo, jwtManager)
 	sdkHandler.SetWebhookService(webhookService)
 	sseHandler := handler.NewSSEHandler()
 	configHandler := handler.NewConfigHandler(configRepo, cfg)
+	configHandler.SetCachedConfigRepo(cachedConfigRepo)
 	webhookHandler := handler.NewWebhookHandler(webhookService)
 	oidcHandler := handler.NewOIDCHandler(cfg.JWT.Issuer)
-	baseURL := fmt.Sprintf("http://%s:%d", cfg.Server.Host, cfg.Server.Port)
+	oidcHandler.SetCache(cacheInstance)
 	deviceHandler := handler.NewDeviceHandler(deviceCodeRepo, appRepo, baseURL, frontendURL)
 	oidcHandler.SetOAuthRepo(oauthRepo, jwtManager) // 设置OAuth仓库用于token撤销
 	avatarHandler := handler.NewAvatarHandler(userRepo, "./uploads/avatars", "/avatars")
@@ -227,6 +245,7 @@ func Setup(cfg *config.Config, cacheInstance cache.Cache) (*gin.Engine, func()) 
 	oauthAPIAuth := r.Group("/api/oauth")
 	oauthAPIAuth.Use(middleware.Auth(jwtManager, tokenBlacklist))
 	{
+		oauthAPIAuth.GET("/authorize/pending", oauthHandler.GetAuthorizePending)
 		oauthAPIAuth.POST("/authorize", oauthHandler.AuthorizeSubmit)
 		// Device Flow authorization (requires auth)
 		oauthAPIAuth.POST("/device/authorize", deviceHandler.DeviceAuthorizeSubmit)
@@ -271,6 +290,7 @@ func Setup(cfg *config.Config, cacheInstance cache.Cache) (*gin.Engine, func()) 
 			apps.POST("/:id/delete", appHandler.DeleteApp)
 			apps.POST("/:id/reset-secret", appHandler.ResetSecret)
 			apps.GET("/:id/stats", appHandler.GetAppStats)
+			apps.GET("/:id/users", appHandler.GetAuthorizedUsers)
 
 			// Webhook routes
 			apps.GET("/:id/webhooks", webhookHandler.ListWebhooks)
@@ -375,7 +395,16 @@ func Setup(cfg *config.Config, cacheInstance cache.Cache) (*gin.Engine, func()) 
 	})
 
 	// Token signing endpoint (for apps to sign custom tokens)
-	r.POST("/token/sign", sdkHandler.SignToken)
+	/*
+	 * /token/sign 安全加固（0day C-1 修复）：
+	 * - 移入 AuthRateLimiter 组，避免暴力枚举 client_secret
+	 * - 实际签发逻辑在 sdkHandler.SignToken 中强制：confidential/machine only + role=service + aud=client_id
+	 */
+	signTokenGroup := r.Group("/token")
+	signTokenGroup.Use(middleware.AuthRateLimiter())
+	{
+		signTokenGroup.POST("/sign", sdkHandler.SignToken)
+	}
 
 	/* SSE 事件流 - 使用 Cookie 鉴权（EventSource 自动携带 Cookie，无需查询字符串传递 token） */
 	events := r.Group("/api/events")

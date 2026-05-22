@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useAuth } from '@/lib/auth-context';
 import { useI18n } from '@/lib/i18n';
 import { api, AuthEvent } from '@/lib/api';
+import { authEventShowsUser, getAuthEventLabel } from '@/lib/auth-event-labels';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { 
@@ -12,6 +13,7 @@ import {
   UserPlus, 
   LogIn, 
   Shield, 
+  Monitor,
   XCircle,
   Wifi,
   WifiOff,
@@ -23,6 +25,10 @@ const eventIcons = {
   user_login: LogIn,
   oauth_authorized: Shield,
   oauth_revoked: XCircle,
+  token_issued: Activity,
+  token_refreshed: Activity,
+  user_updated: UserPlus,
+  device_authorized: Monitor,
 };
 
 const eventColors = {
@@ -30,9 +36,11 @@ const eventColors = {
   user_login: 'text-blue-500 bg-blue-50',
   oauth_authorized: 'text-purple-500 bg-purple-50',
   oauth_revoked: 'text-red-500 bg-red-50',
+  token_issued: 'text-amber-500 bg-amber-50',
+  token_refreshed: 'text-orange-500 bg-orange-50',
+  user_updated: 'text-teal-500 bg-teal-50',
+  device_authorized: 'text-indigo-500 bg-indigo-50',
 };
-
-/* eventLabels 通过 i18n 动态获取，见组件内 getEventLabel */
 
 export default function EventsPage() {
   const { user } = useAuth();
@@ -161,7 +169,9 @@ export default function EventsPage() {
         <CardHeader>
           <CardTitle>{t('admin.events.title')}</CardTitle>
           <CardDescription>
-            {events.length > 0 ? `${events.length} ${t('admin.events.title')}` : t('admin.events.waitingForEvents')}
+            {events.length > 0
+              ? t('admin.events.eventCount', { count: String(events.length) })
+              : t('admin.events.waitingForEvents')}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -178,13 +188,8 @@ export default function EventsPage() {
               {events.map((event, index) => {
                 const Icon = eventIcons[event.type] || Activity;
                 const colorClass = eventColors[event.type] || 'text-slate-500 bg-slate-50';
-                const eventLabelMap: Record<string, string> = {
-                  user_registered: t('admin.events.userRegistered'),
-                  user_login: t('admin.events.userLogin'),
-                  oauth_authorized: t('admin.events.oauthAuthorized'),
-                  oauth_revoked: t('admin.events.oauthRevoked'),
-                };
-                const label = eventLabelMap[event.type] || event.type;
+                const label = getAuthEventLabel(t, event.type);
+                const showUser = authEventShowsUser(event.type);
 
                 return (
                   <div 
@@ -201,13 +206,26 @@ export default function EventsPage() {
                           {formatTime(event.timestamp)}
                         </span>
                       </div>
-                      <div className="text-sm text-muted-foreground mt-1">
-                        <span className="font-medium">{event.username}</span>
-                        {event.email && <span className="ml-2">({event.email})</span>}
-                      </div>
+                      {showUser && (event.username || event.email) && (
+                        <div className="text-sm text-muted-foreground mt-1">
+                          <span className="font-medium">{event.username || '—'}</span>
+                          {event.email && <span className="ml-2">({event.email})</span>}
+                        </div>
+                      )}
                       <div className="text-xs text-muted-foreground mt-1">
-                        {t('admin.events.appLabel')}: {event.app_name}
-                        {event.scope && <span className="ml-2">| {t('admin.events.scopeLabel')}: {event.scope}</span>}
+                        {event.app_name
+                          ? <>{t('admin.events.appLabel')}: {event.app_name}</>
+                          : null}
+                        {event.scope && (
+                          <span className={event.app_name ? 'ml-2' : ''}>
+                            {event.app_name ? '| ' : ''}{t('admin.events.scopeLabel')}: {event.scope}
+                          </span>
+                        )}
+                        {event.grant_type && (
+                          <span className="ml-2">
+                            | {t('admin.events.grantTypeLabel')}: {event.grant_type}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
