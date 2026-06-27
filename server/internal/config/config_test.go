@@ -140,6 +140,112 @@ func TestApplyEnvOverrides_NoEnv_NoChange(t *testing.T) {
 	}
 }
 
+func TestApplyEnvOverrides_ExtendedFields(t *testing.T) {
+	cfg := defaultConfig()
+	os.Setenv("DB_MAX_OPEN_CONNS", "64")
+	os.Setenv("DB_MAX_IDLE_CONNS", "16")
+	os.Setenv("DB_CONN_MAX_LIFETIME_MIN", "30")
+	os.Setenv("DB_CONN_MAX_IDLE_TIME_MIN", "5")
+	os.Setenv("CACHE_PREFIX", "oauth2:test:")
+	os.Setenv("CACHE_DEFAULT_TTL_SEC", "900")
+	os.Setenv("MEMCACHED_SERVERS", "127.0.0.1:11211,127.0.0.1:11212")
+	os.Setenv("BADGER_PATH", "/tmp/badger-cache")
+	os.Setenv("CACHE_FILE_DIR", "/tmp/file-cache")
+	os.Setenv("EMAIL_FROM_NAME", "OAuth2 Mailer")
+	os.Setenv("EMAIL_USE_TLS", "false")
+	os.Setenv("SOCIAL_ENABLED", "true")
+	os.Setenv("SOCIAL_GITHUB_ENABLED", "true")
+	os.Setenv("SOCIAL_GITHUB_CLIENT_ID", "gh-client")
+	os.Setenv("SOCIAL_GITHUB_CLIENT_SECRET", "gh-secret")
+	os.Setenv("SOCIAL_GOOGLE_ENABLED", "true")
+	os.Setenv("SOCIAL_GOOGLE_CLIENT_ID", "google-client")
+	os.Setenv("SOCIAL_GOOGLE_CLIENT_SECRET", "google-secret")
+	os.Setenv("LOG_LEVEL", "debug")
+	os.Setenv("LOG_FORMAT", "json")
+	os.Setenv("LOG_FILE_OUTPUT", "/tmp/oauth2.log")
+	os.Setenv("LOG_MAX_SIZE_MB", "256")
+	os.Setenv("LOG_MAX_BACKUPS", "9")
+	os.Setenv("LOG_MAX_AGE_DAYS", "14")
+	os.Setenv("LOG_COMPRESS", "true")
+	defer func() {
+		os.Unsetenv("DB_MAX_OPEN_CONNS")
+		os.Unsetenv("DB_MAX_IDLE_CONNS")
+		os.Unsetenv("DB_CONN_MAX_LIFETIME_MIN")
+		os.Unsetenv("DB_CONN_MAX_IDLE_TIME_MIN")
+		os.Unsetenv("CACHE_PREFIX")
+		os.Unsetenv("CACHE_DEFAULT_TTL_SEC")
+		os.Unsetenv("MEMCACHED_SERVERS")
+		os.Unsetenv("BADGER_PATH")
+		os.Unsetenv("CACHE_FILE_DIR")
+		os.Unsetenv("EMAIL_FROM_NAME")
+		os.Unsetenv("EMAIL_USE_TLS")
+		os.Unsetenv("SOCIAL_ENABLED")
+		os.Unsetenv("SOCIAL_GITHUB_ENABLED")
+		os.Unsetenv("SOCIAL_GITHUB_CLIENT_ID")
+		os.Unsetenv("SOCIAL_GITHUB_CLIENT_SECRET")
+		os.Unsetenv("SOCIAL_GOOGLE_ENABLED")
+		os.Unsetenv("SOCIAL_GOOGLE_CLIENT_ID")
+		os.Unsetenv("SOCIAL_GOOGLE_CLIENT_SECRET")
+		os.Unsetenv("LOG_LEVEL")
+		os.Unsetenv("LOG_FORMAT")
+		os.Unsetenv("LOG_FILE_OUTPUT")
+		os.Unsetenv("LOG_MAX_SIZE_MB")
+		os.Unsetenv("LOG_MAX_BACKUPS")
+		os.Unsetenv("LOG_MAX_AGE_DAYS")
+		os.Unsetenv("LOG_COMPRESS")
+	}()
+
+	cfg.applyEnvOverrides()
+	if cfg.Database.MaxOpenConns != 64 {
+		t.Errorf("Database.MaxOpenConns = %d, want 64", cfg.Database.MaxOpenConns)
+	}
+	if cfg.Database.MaxIdleConns != 16 {
+		t.Errorf("Database.MaxIdleConns = %d, want 16", cfg.Database.MaxIdleConns)
+	}
+	if cfg.Database.ConnMaxLifetimeMin != 30 {
+		t.Errorf("Database.ConnMaxLifetimeMin = %d, want 30", cfg.Database.ConnMaxLifetimeMin)
+	}
+	if cfg.Database.ConnMaxIdleTimeMin != 5 {
+		t.Errorf("Database.ConnMaxIdleTimeMin = %d, want 5", cfg.Database.ConnMaxIdleTimeMin)
+	}
+	if cfg.Cache.Prefix != "oauth2:test:" {
+		t.Errorf("Cache.Prefix = %q, want %q", cfg.Cache.Prefix, "oauth2:test:")
+	}
+	if cfg.Cache.DefaultTTLSec != 900 {
+		t.Errorf("Cache.DefaultTTLSec = %d, want 900", cfg.Cache.DefaultTTLSec)
+	}
+	if len(cfg.Cache.MemcachedServers) != 2 || cfg.Cache.MemcachedServers[0] != "127.0.0.1:11211" || cfg.Cache.MemcachedServers[1] != "127.0.0.1:11212" {
+		t.Errorf("Cache.MemcachedServers = %#v, want parsed list", cfg.Cache.MemcachedServers)
+	}
+	if cfg.Cache.BadgerPath != "/tmp/badger-cache" {
+		t.Errorf("Cache.BadgerPath = %q, want /tmp/badger-cache", cfg.Cache.BadgerPath)
+	}
+	if cfg.Cache.FileDir != "/tmp/file-cache" {
+		t.Errorf("Cache.FileDir = %q, want /tmp/file-cache", cfg.Cache.FileDir)
+	}
+	if cfg.Email.FromName != "OAuth2 Mailer" {
+		t.Errorf("Email.FromName = %q, want %q", cfg.Email.FromName, "OAuth2 Mailer")
+	}
+	if cfg.Email.UseTLS {
+		t.Error("Email.UseTLS = true, want false")
+	}
+	if !cfg.Social.Enabled || !cfg.Social.GitHub.Enabled || !cfg.Social.Google.Enabled {
+		t.Errorf("Social enabled flags not applied: %+v", cfg.Social)
+	}
+	if cfg.Social.GitHub.ClientID != "gh-client" || cfg.Social.GitHub.ClientSecret != "gh-secret" {
+		t.Errorf("GitHub social config mismatch: %+v", cfg.Social.GitHub)
+	}
+	if cfg.Social.Google.ClientID != "google-client" || cfg.Social.Google.ClientSecret != "google-secret" {
+		t.Errorf("Google social config mismatch: %+v", cfg.Social.Google)
+	}
+	if cfg.Log.Level != "debug" || cfg.Log.Format != "json" || cfg.Log.FileOutput != "/tmp/oauth2.log" {
+		t.Errorf("Log config mismatch: %+v", cfg.Log)
+	}
+	if cfg.Log.MaxSizeMB != 256 || cfg.Log.MaxBackups != 9 || cfg.Log.MaxAgeDays != 14 || !cfg.Log.Compress {
+		t.Errorf("Log rotation config mismatch: %+v", cfg.Log)
+	}
+}
+
 /* ========== defaultConfig ========== */
 
 func TestDefaultConfig_HasValidDefaults(t *testing.T) {

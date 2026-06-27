@@ -15,10 +15,9 @@ import (
  * 功能：在启动期主动填充 Redis/统一缓存中的热数据，降低冷启动回源抖动
  */
 type CacheWarmer struct {
-	cache            cache.Cache
-	federationRepo   *repository.CachedFederationRepository
-	configRepo       *repository.CachedConfigRepository
-	issuer           string
+	cache          cache.Cache
+	federationRepo *repository.CachedFederationRepository
+	configRepo     *repository.CachedConfigRepository
 }
 
 /* NewCacheWarmer 创建缓存预热服务 */
@@ -26,13 +25,11 @@ func NewCacheWarmer(
 	c cache.Cache,
 	federationRepo *repository.CachedFederationRepository,
 	configRepo *repository.CachedConfigRepository,
-	issuer string,
 ) *CacheWarmer {
 	return &CacheWarmer{
 		cache:          c,
 		federationRepo: federationRepo,
 		configRepo:     configRepo,
-		issuer:         issuer,
 	}
 }
 
@@ -52,8 +49,6 @@ func (w *CacheWarmer) Warmup(ctx context.Context, allowRegistration bool) error 
 		}
 	}
 
-	_ = cache.SetJSON(ctx, w.cache, "oidc:discovery:"+w.issuer, map[string]string{"status": "warm"}, 2*time.Minute)
-	_ = cache.SetJSON(ctx, w.cache, "oidc:jwks:"+w.issuer, map[string]string{"status": "warm"}, 2*time.Minute)
 	_ = cache.SetJSON(ctx, w.cache, "meta:cache_warmed", map[string]any{"at": time.Now().UTC().Format(time.RFC3339), "allow_registration": allowRegistration}, 5*time.Minute)
 	return nil
 }

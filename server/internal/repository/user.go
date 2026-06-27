@@ -115,6 +115,28 @@ func (r *UserRepository) FindByUsername(username string) (*model.User, error) {
 }
 
 /*
+ * FindByExternalIdentity 根据来源系统和外部用户 ID 精确查找用户
+ * @param externalSource - 来源系统
+ * @param externalID - 外部系统用户 ID
+ * @return *model.User - 用户实体，未找到时返回 ErrUserNotFound
+ */
+func (r *UserRepository) FindByExternalIdentity(externalSource, externalID string) (*model.User, error) {
+	if externalSource == "" || externalID == "" {
+		return nil, ErrUserNotFound
+	}
+
+	var user model.User
+	result := r.db.First(&user, "external_source = ? AND external_id = ?", externalSource, externalID)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, result.Error
+	}
+	return &user, nil
+}
+
+/*
  * Update 更新用户信息
  * @param user - 包含更新字段的用户实体
  */

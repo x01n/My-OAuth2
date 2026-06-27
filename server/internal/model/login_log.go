@@ -19,6 +19,8 @@ const (
 	LoginTypeDirect LoginType = "direct" // Direct login via web UI
 	LoginTypeOAuth  LoginType = "oauth"  // OAuth authorization login
 	LoginTypeSDK    LoginType = "sdk"    // SDK login
+	LoginTypeLDAP   LoginType = "ldap"   // Enterprise directory login
+	LoginTypeSAML   LoginType = "saml"   // SAML 2.0 login
 )
 
 /*

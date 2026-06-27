@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
@@ -21,6 +22,34 @@ import (
 )
 
 var DB *gorm.DB
+
+func redactDSN(driver, dsn string) string {
+	switch driver {
+	case "postgres":
+		if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+			parsed, err := url.Parse(dsn)
+			if err == nil {
+				if parsed.User != nil {
+					username := parsed.User.Username()
+					if username != "" {
+						parsed.User = url.UserPassword(username, "***REDACTED***")
+					} else {
+						parsed.User = url.User("***REDACTED***")
+					}
+				}
+				return parsed.String()
+			}
+		}
+	case "mysql":
+		if at := strings.LastIndex(dsn, "@"); at > 0 {
+			creds := dsn[:at]
+			if colon := strings.Index(creds, ":"); colon >= 0 {
+				return creds[:colon+1] + "***REDACTED***" + dsn[at:]
+			}
+		}
+	}
+	return dsn
+}
 
 func normalizeDSN(driver, dsn string) string {
 	switch driver {
@@ -130,7 +159,7 @@ func Init(cfg *config.DatabaseConfig) error {
 	/* 规范化 DSN：自动补全各驱动关键参数 */
 	normalizedDSN := normalizeDSN(cfg.Driver, cfg.DSN)
 	if normalizedDSN != cfg.DSN {
-		logger.Info("Database DSN normalized", "driver", cfg.Driver, "dsn", normalizedDSN)
+		logger.Info("Database DSN normalized", "driver", cfg.Driver, "dsn", redactDSN(cfg.Driver, normalizedDSN))
 	}
 
 	switch cfg.Driver {
@@ -154,6 +183,7 @@ func Init(cfg *config.DatabaseConfig) error {
 		Logger:                 gormLogger,
 		SkipDefaultTransaction: true,
 		PrepareStmt:            usePrepareStmt,
+		TranslateError:         true,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
@@ -175,11 +205,17 @@ func Init(cfg *config.DatabaseConfig) error {
 		&model.SystemConfig{},
 		&model.UserAuthorization{},
 		&model.LoginLog{},
+		&model.RiskEvent{},
+		&model.SDKExternalIdentity{},
 		&model.Webhook{},
 		&model.WebhookDelivery{},
 		&model.FederatedProvider{},
 		&model.FederatedIdentity{},
 		&model.TrustedApp{},
+		&model.LDAPProvider{},
+		&model.LDAPIdentity{},
+		&model.SAMLProvider{},
+		&model.SAMLIdentity{},
 		&model.PasswordReset{},
 		&model.DeviceCode{},
 		&model.EmailVerification{},

@@ -23,8 +23,11 @@ export default function AdminConfigPage() {
     site_name: '',
   });
 
-  const loadConfig = useCallback(async () => {
+  const loadConfig = useCallback(async (ignoreResult?: () => boolean) => {
     const response = await api.getAdminConfig();
+    if (ignoreResult?.()) {
+      return;
+    }
     if (response.success && response.data) {
       setConfig({
         frontend_url: response.data.frontend_url || '',
@@ -36,8 +39,17 @@ export default function AdminConfigPage() {
   }, []);
 
   useEffect(() => {
-    loadConfig();
-  }, [loadConfig]);
+    if (user?.role === 'admin') {
+      let ignore = false;
+      loadConfig(() => ignore);
+      return () => {
+        ignore = true;
+      };
+    }
+    if (user?.role === 'user') {
+      setIsLoading(false);
+    }
+  }, [user, loadConfig]);
 
   const handleSave = async () => {
     setIsSaving(true);

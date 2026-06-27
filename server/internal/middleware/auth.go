@@ -14,6 +14,7 @@ import (
 	"server/pkg/jwt"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const (
@@ -60,6 +61,20 @@ func authError(c *gin.Context, code, message string) {
 	})
 }
 
+func isStoredAccessTokenUsable(oauthRepo *repository.OAuthRepository, token string, clientID string, userID uuid.UUID) bool {
+	accessToken, err := oauthRepo.FindAccessToken(token)
+	if err != nil {
+		return false
+	}
+	if !accessToken.IsValid() || accessToken.ClientID != clientID {
+		return false
+	}
+	if !accessToken.HasEndUser() || accessToken.UserID == nil {
+		return false
+	}
+	return *accessToken.UserID == userID
+}
+
 /**
  * Auth 创建 JWT 鉴权中间件
  *
@@ -76,6 +91,10 @@ func authError(c *gin.Context, code, message string) {
  * @security 用户状态为 disabled/suspended 时即时拒绝（不依赖 token 黑名单的最终一致性）
  */
 func Auth(jwtManager *jwt.Manager, blacklist ...*jwt.Blacklist) gin.HandlerFunc {
+	return AuthWithOAuthRepo(jwtManager, nil, blacklist...)
+}
+
+func AuthWithOAuthRepo(jwtManager *jwt.Manager, oauthRepo *repository.OAuthRepository, blacklist ...*jwt.Blacklist) gin.HandlerFunc {
 	var bl *jwt.Blacklist
 	if len(blacklist) > 0 {
 		bl = blacklist[0]
@@ -113,6 +132,11 @@ func Auth(jwtManager *jwt.Manager, blacklist ...*jwt.Blacklist) gin.HandlerFunc 
 			}
 		}
 
+		if oauthRepo != nil && !isStoredAccessTokenUsable(oauthRepo, tokenString, claims.ClientID, claims.UserID) {
+			authError(c, "TOKEN_REVOKED", "Token has been revoked")
+			return
+		}
+
 		/* 用户状态实时校验：disabled/suspended 用户即时拒绝（即使 token 未过期） */
 		if userRepo := getUserRepo(c); userRepo != nil {
 			user, err := userRepo.FindByID(claims.UserID)
@@ -124,6 +148,8 @@ func Auth(jwtManager *jwt.Manager, blacklist ...*jwt.Blacklist) gin.HandlerFunc 
 
 		ctx.SetUser(c, claims.UserID, claims.Email, claims.Username, claims.Role)
 		ctx.SetClientID(c, claims.ClientID)
+		ctx.SetAuthTime(c, claims.AuthTime)
+		ctx.SetAuthMethods(c, claims.AMR)
 		c.Next()
 	}
 }
@@ -166,6 +192,8 @@ func OptionalAuth(jwtManager *jwt.Manager, blacklist ...*jwt.Blacklist) gin.Hand
 
 		ctx.SetUser(c, claims.UserID, claims.Email, claims.Username, claims.Role)
 		ctx.SetClientID(c, claims.ClientID)
+		ctx.SetAuthTime(c, claims.AuthTime)
+		ctx.SetAuthMethods(c, claims.AMR)
 		c.Next()
 	}
 }

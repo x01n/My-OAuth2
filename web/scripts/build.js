@@ -1,8 +1,4 @@
-/**
- * 跨平台构建脚本
- * 功能：清理 dist 目录 → 执行 next build → 复制 out 到 dist
- */
-const { execSync } = require('child_process');
+const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -10,7 +6,44 @@ const ROOT = path.resolve(__dirname, '..');
 const DIST = path.resolve(ROOT, '../server/web/dist');
 const OUT = path.resolve(ROOT, 'out');
 
-/* 递归复制目录 */
+const BASELINE_BROWSER_MAPPING_WARNING =
+  '[baseline-browser-mapping] The data in this module is over two months old.';
+
+function run(args) {
+  const executable = process.platform === 'win32' ? 'bun.exe' : 'bun';
+  const result = spawnSync(executable, args, {
+    cwd: ROOT,
+    env: process.env,
+    shell: false,
+    encoding: 'utf8',
+  });
+
+  writeFilteredOutput(process.stdout, result.stdout);
+  writeFilteredOutput(process.stderr, result.stderr);
+
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    process.exit(result.status || 1);
+  }
+}
+
+function writeFilteredOutput(stream, output) {
+  if (!output) {
+    return;
+  }
+  for (const line of output.split(/\r?\n/)) {
+    if (!line) {
+      continue;
+    }
+    if (line.includes(BASELINE_BROWSER_MAPPING_WARNING)) {
+      continue;
+    }
+    stream.write(`${line}\n`);
+  }
+}
+
 function copyDir(src, dest) {
   fs.mkdirSync(dest, { recursive: true });
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
@@ -23,19 +56,12 @@ function copyDir(src, dest) {
     }
   }
 }
-
-/* 1. 清理 dist */
-console.log('[build] 清理 dist 目录...');
 fs.rmSync(DIST, { recursive: true, force: true });
+fs.rmSync(OUT, { recursive: true, force: true });
 fs.mkdirSync(DIST, { recursive: true });
 fs.writeFileSync(path.join(DIST, 'placeholder.txt'), 'placeholder\n');
-
-/* 2. 执行 next build */
-console.log('[build] 执行 next build...');
-execSync('bunx next build --webpack', { cwd: ROOT, stdio: 'inherit' });
-
-/* 3. 复制 out → dist */
-console.log('[build] 复制构建产物到 dist...');
+run(['run', 'typecheck']);
+run(['x', 'next', 'build', '--webpack']);
 if (fs.existsSync(OUT)) {
   copyDir(OUT, DIST);
   console.log('[build] 完成!');

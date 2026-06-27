@@ -314,23 +314,41 @@ export default function AdminPage() {
   const [editingUser, setEditingUser] = useState<User | null>(null);
   const [viewingUser, setViewingUser] = useState<User | null>(null);
 
-  const loadStats = useCallback(async () => {
+  const loadStats = useCallback(async (ignoreResult?: () => boolean) => {
     const [statsRes, trendRes] = await Promise.all([api.getAdminStats(), api.getLoginTrend(7)]);
+    if (ignoreResult?.()) return;
     if (statsRes.success && statsRes.data) setStats(statsRes.data);
     if (trendRes.success && trendRes.data) setLoginTrend(trendRes.data.trend);
   }, []);
 
-  const loadUsers = useCallback(async () => {
+  const loadUsers = useCallback(async (ignoreResult?: () => boolean) => {
     setIsLoading(true);
     let response;
     if (searchQuery || roleFilter || statusFilter) { response = await api.searchUsers(searchQuery, { role: roleFilter, status: statusFilter }, page, limit); }
     else { response = await api.getAdminUsers(page, limit); }
+    if (ignoreResult?.()) return;
     if (response.success && response.data) { setUsers(response.data.users); setTotal(response.data.total); }
     setIsLoading(false);
   }, [page, limit, searchQuery, roleFilter, statusFilter]);
 
-  useEffect(() => { if (user && user.role !== 'admin') { router.push('/dashboard'); return; } loadStats(); }, [user, router, loadStats]);
-  useEffect(() => { loadUsers(); }, [loadUsers]);
+  useEffect(() => {
+    if (user && user.role !== 'admin') {
+      router.push('/dashboard');
+      return;
+    }
+    if (user?.role === 'admin') {
+      let ignore = false;
+      loadStats(() => ignore);
+      return () => { ignore = true; };
+    }
+  }, [user, router, loadStats]);
+  useEffect(() => {
+    if (user?.role === 'admin') {
+      let ignore = false;
+      loadUsers(() => ignore);
+      return () => { ignore = true; };
+    }
+  }, [user?.role, loadUsers]);
 
   const handleSearch = () => { setPage(1); setSearchQuery(searchInput); };
   const clearSearch = () => { setSearchInput(''); setSearchQuery(''); setRoleFilter(''); setStatusFilter(''); setPage(1); };

@@ -67,9 +67,9 @@ func (FederatedProvider) TableName() string {
  */
 type FederatedIdentity struct {
 	ID            uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
-	UserID        uuid.UUID `gorm:"type:uuid;index;not null" json:"user_id"`
-	ProviderID    uuid.UUID `gorm:"type:uuid;index;not null" json:"provider_id"`
-	ExternalID    string    `gorm:"size:255;not null" json:"external_id"` // 外部系统的用户ID (sub)
+	UserID        uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:idx_fed_identity_user_provider,priority:1" json:"user_id"`
+	ProviderID    uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:idx_fed_identity_user_provider,priority:2;uniqueIndex:idx_fed_identity_provider_external,priority:1" json:"provider_id"`
+	ExternalID    string    `gorm:"size:255;not null;uniqueIndex:idx_fed_identity_provider_external,priority:2" json:"external_id"` // 外部系统的用户ID (sub)
 	ExternalEmail string    `gorm:"size:255" json:"external_email,omitempty"`
 
 	// Cached external data

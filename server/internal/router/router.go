@@ -36,7 +36,7 @@ func SetBuildInfo(id string) {
  * Setup 初始化路由和所有依赖，返回 gin.Engine 和 cleanup 函数
  * cleanup 函数在优雅关停时调用，停止邮件队列等后台服务
  */
-func Setup(cfg *config.Config, cacheInstance cache.Cache) (*gin.Engine, func()) {
+func Setup(cfg *config.Config, cacheInstance cache.Cache) (*gin.Engine, *service.LDAPSyncService, func()) {
 	// Set gin mode
 	gin.SetMode(cfg.Server.Mode)
 
@@ -70,38 +70,51 @@ func Setup(cfg *config.Config, cacheInstance cache.Cache) (*gin.Engine, func()) 
 	 * 必须在所有 Auth/OptionalAuth 中间件之前注册
 	 */
 	r.Use(middleware.WithUserRepo(userRepo))
-appRepo := repository.NewApplicationRepository(db)
+	appRepo := repository.NewApplicationRepository(db)
 	oauthRepo := repository.NewOAuthRepository(db)
 	configRepo := repository.NewConfigRepository(db)
 	cachedConfigRepo := repository.NewCachedConfigRepository(configRepo, cacheInstance)
 	loginLogRepo := repository.NewLoginLogRepository(db)
+	riskEventRepo := repository.NewRiskEventRepository(db)
 	userAuthRepo := repository.NewUserAuthorizationRepository(db)
 	webhookRepo := repository.NewWebhookRepository(db)
 	passwordResetRepo := repository.NewPasswordResetRepository(db)
 	federationRepo := repository.NewFederationRepository(db)
+	ldapProviderRepo := repository.NewLDAPProviderRepository(db)
+	ldapIdentityRepo := repository.NewLDAPIdentityRepository(db)
+	samlProviderRepo := repository.NewSAMLProviderRepository(db)
+	samlIdentityRepo := repository.NewSAMLIdentityRepository(db)
+	sdkExternalRepo := repository.NewSDKExternalIdentityRepository(db)
 	// 缓存包装的 Federation Repository（支持 memory / redis 后端，减少 ListProviders 热路径 DB 查询）
 	cachedFederationRepo := repository.NewCachedFederationRepository(federationRepo, cacheInstance)
 	deviceCodeRepo := repository.NewDeviceCodeRepository(db)
 	emailVerifyRepo := repository.NewEmailVerificationRepository(db)
 
 	// Services
+	anomalyService := service.NewAnomalyDetectionService(loginLogRepo, userRepo)
 	authService := service.NewAuthService(userRepo, loginLogRepo, jwtManager, cfg)
 	authService.SetOAuthRepo(oauthRepo)           // 启用 refresh token 轮换
 	authService.SetTokenBlacklist(tokenBlacklist) // 启用 access token 即时吊销
-	authService.SetCleanupRepos(appRepo, userAuthRepo, federationRepo, deviceCodeRepo, passwordResetRepo, emailVerifyRepo)
+	authService.SetAnomalyDetectionService(anomalyService)
+	authService.SetRiskEventRepository(riskEventRepo)
+	authService.SetCleanupRepos(appRepo, userAuthRepo, federationRepo, sdkExternalRepo, deviceCodeRepo, passwordResetRepo, emailVerifyRepo)
 	appService := service.NewApplicationService(appRepo)
 	appService.SetCleanupRepos(oauthRepo, webhookRepo, userAuthRepo)
 	oauthService := service.NewOAuthService(appRepo, oauthRepo, userRepo, userAuthRepo, cfg)
 	oauthService.SetJWTManager(jwtManager)
+	oauthService.SetRiskEventRepository(riskEventRepo)
 	oauthService.SetDeviceCodeRepository(deviceCodeRepo) // Enable device flow
 	webhookService := service.NewWebhookService(webhookRepo, cfg.Server.Mode == "debug")
 	passwordResetService := service.NewPasswordResetService(userRepo, passwordResetRepo)
 	emailVerifyService := service.NewEmailVerificationService(userRepo, emailVerifyRepo)
 	socialAuthService := service.NewSocialAuthService(userRepo, cachedFederationRepo.FederationRepository, loginLogRepo, jwtManager, cfg)
 	socialAuthService.SetOAuthRepo(oauthRepo) // 启用 refresh token 轮换
-	_ = cachedFederationRepo                  // 缓存 repo 已注册，可用于将来扩展
+	ldapAuthService := service.NewLDAPAuthService(ldapProviderRepo, ldapIdentityRepo, userRepo, loginLogRepo, authService)
+	ldapSyncService := service.NewLDAPSyncService(ldapProviderRepo, ldapIdentityRepo, userRepo)
+	samlAuthService := service.NewSAMLAuthService(samlProviderRepo, samlIdentityRepo, userRepo, loginLogRepo, authService)
+	_ = cachedFederationRepo // 缓存 repo 已注册，可用于将来扩展
 
-	cacheWarmer := service.NewCacheWarmer(cacheInstance, cachedFederationRepo, cachedConfigRepo, cfg.JWT.Issuer)
+	cacheWarmer := service.NewCacheWarmer(cacheInstance, cachedFederationRepo, cachedConfigRepo)
 	if err := cacheWarmer.Warmup(context.Background(), cfg.Server.AllowRegistration); err != nil {
 		logger.Warn("Cache warmup failed", "error", err)
 	}
@@ -112,19 +125,27 @@ appRepo := repository.NewApplicationRepository(db)
 		frontendURL = url
 	}
 
+	baseURL := handler.BrowserReachableBaseURL(fmt.Sprintf("http://%s:%d", cfg.Server.Host, cfg.Server.Port))
+
 	// Handlers
 	authHandler := handler.NewAuthHandler(authService, cfg)
 	authHandler.SetWebhookService(webhookService)
 	passwordResetHandler := handler.NewPasswordResetHandler(passwordResetService)
 	socialAuthHandler := handler.NewSocialAuthHandler(socialAuthService)
+	ldapAuthHandler := handler.NewLDAPAuthHandler(ldapAuthService, cfg)
+	ldapAuthHandler.SetWebhookService(webhookService)
+	samlAuthHandler := handler.NewSAMLAuthHandler(samlProviderRepo, samlAuthService, cfg, baseURL, frontendURL)
+	samlAuthHandler.SetWebhookService(webhookService)
 	userHandler := handler.NewUserHandler(authService, userRepo, userAuthRepo)
 	userHandler.SetWebhookService(webhookService)
 	userHandler.SetOAuthRepo(oauthRepo, appRepo)
 	appHandler := handler.NewApplicationHandler(appService)
-	baseURL := handler.BrowserReachableBaseURL(fmt.Sprintf("http://%s:%d", cfg.Server.Host, cfg.Server.Port))
 	oauthHandler := handler.NewOAuthHandler(oauthService, webhookService, frontendURL, baseURL)
-	adminHandler := handler.NewAdminHandler(userRepo, appRepo, loginLogRepo, userAuthRepo)
+	adminHandler := handler.NewAdminHandler(userRepo, appRepo, loginLogRepo, riskEventRepo, userAuthRepo)
 	sdkHandler := handler.NewSDKHandler(authService, appRepo, jwtManager)
+	sdkHandler.SetOAuthRepo(oauthRepo)
+	sdkHandler.SetSDKExternalIdentityRepo(sdkExternalRepo)
+	sdkHandler.SetRiskEventRepository(riskEventRepo)
 	sdkHandler.SetWebhookService(webhookService)
 	sseHandler := handler.NewSSEHandler()
 	configHandler := handler.NewConfigHandler(configRepo, cfg)
@@ -134,10 +155,12 @@ appRepo := repository.NewApplicationRepository(db)
 	oidcHandler.SetCache(cacheInstance)
 	deviceHandler := handler.NewDeviceHandler(deviceCodeRepo, appRepo, baseURL, frontendURL)
 	oidcHandler.SetOAuthRepo(oauthRepo, jwtManager) // 设置OAuth仓库用于token撤销
+	oidcHandler.SetApplicationRepo(appRepo)
 	avatarHandler := handler.NewAvatarHandler(userRepo, "./uploads/avatars", "/avatars")
 	systemConfigHandler := handler.NewSystemConfigHandler(cfg)
-	federationHandler := handler.NewFederationHandler(federationRepo, userRepo, jwtManager, baseURL)
+	federationHandler := handler.NewFederationHandler(federationRepo, userRepo, jwtManager, baseURL, cfg)
 	federationHandler.SetOAuthRepo(oauthRepo) // 启用 refresh token 轮换
+	enterpriseSSOHandler := handler.NewEnterpriseSSOHandler(ldapProviderRepo, samlProviderRepo, baseURL)
 
 	// 初始化邮件服务
 	var emailService *email.Service
@@ -194,14 +217,18 @@ appRepo := repository.NewApplicationRepository(db)
 			auth.POST("/register", authHandler.Register)
 			auth.POST("/login", authHandler.Login)
 			auth.POST("/check-password", authHandler.CheckPasswordStrength)
-			auth.POST("/refresh", authHandler.Refresh)
-			auth.POST("/logout", authHandler.Logout)
 			auth.POST("/forgot-password", passwordResetHandler.ForgotPassword)
 			auth.POST("/validate-reset-token", passwordResetHandler.ValidateResetToken)
 			auth.POST("/reset-password", passwordResetHandler.ResetPassword)
 			auth.GET("/social/providers", socialAuthHandler.GetProviders)
 			auth.GET("/social/:provider", socialAuthHandler.StartAuth)
 			auth.GET("/social/:provider/callback", socialAuthHandler.Callback)
+		}
+		authCookieState := auth.Group("")
+		authCookieState.Use(middleware.CSRFProtectionWithRiskEventRepository(riskEventRepo))
+		{
+			authCookieState.POST("/refresh", authHandler.Refresh)
+			authCookieState.POST("/logout", authHandler.Logout)
 		}
 		sdk := api.Group("/sdk")
 		{
@@ -243,7 +270,7 @@ appRepo := repository.NewApplicationRepository(db)
 
 	// OAuth2 authorize submission (requires auth)
 	oauthAPIAuth := r.Group("/api/oauth")
-	oauthAPIAuth.Use(middleware.Auth(jwtManager, tokenBlacklist))
+	oauthAPIAuth.Use(middleware.AuthWithOAuthRepo(jwtManager, oauthRepo, tokenBlacklist), middleware.CSRFProtectionWithRiskEventRepository(riskEventRepo))
 	{
 		oauthAPIAuth.GET("/authorize/pending", oauthHandler.GetAuthorizePending)
 		oauthAPIAuth.POST("/authorize", oauthHandler.AuthorizeSubmit)
@@ -253,7 +280,7 @@ appRepo := repository.NewApplicationRepository(db)
 
 	// Protected routes
 	protected := r.Group("/api")
-	protected.Use(middleware.Auth(jwtManager, tokenBlacklist))
+	protected.Use(middleware.AuthWithOAuthRepo(jwtManager, oauthRepo, tokenBlacklist), middleware.CSRFProtectionWithRiskEventRepository(riskEventRepo))
 	{
 		user := protected.Group("/user")
 		{
@@ -304,11 +331,12 @@ appRepo := repository.NewApplicationRepository(db)
 
 	// Admin routes (requires admin role)
 	admin := r.Group("/api/admin")
-	admin.Use(middleware.Auth(jwtManager, tokenBlacklist), middleware.AdminOnly())
+	admin.Use(middleware.AuthWithOAuthRepo(jwtManager, oauthRepo, tokenBlacklist), middleware.CSRFProtectionWithRiskEventRepository(riskEventRepo), middleware.AdminOnly())
 	{
 		admin.GET("/stats", adminHandler.GetStats)
 		admin.GET("/stats/login-trend", adminHandler.GetLoginTrend)
 		admin.GET("/login-logs", adminHandler.GetLoginLogs)
+		admin.GET("/risk-events", adminHandler.GetRiskEvents)
 
 		admin.GET("/users", adminHandler.ListUsers)
 		admin.GET("/users/:id", adminHandler.GetUser)
@@ -367,6 +395,11 @@ appRepo := repository.NewApplicationRepository(db)
 	federation := r.Group("/api/federation")
 	{
 		federation.GET("/providers", federationHandler.ListProviders)
+		federation.GET("/enterprise/providers", enterpriseSSOHandler.ListPublicProviders)
+		federation.POST("/ldap/:slug/login", middleware.AuthRateLimiter(), ldapAuthHandler.Login)
+		federation.GET("/saml/:slug/login", samlAuthHandler.StartLogin)
+		federation.POST("/saml/:slug/acs", samlAuthHandler.ACS)
+		federation.GET("/saml/:slug/metadata", samlAuthHandler.Metadata)
 		federation.GET("/login/:slug", federationHandler.InitiateLogin)
 		federation.GET("/callback/:slug", federationHandler.Callback)
 		federation.POST("/verify", federationHandler.VerifyToken)
@@ -374,12 +407,21 @@ appRepo := repository.NewApplicationRepository(db)
 
 	/* 管理员联邦提供商管理路由 */
 	adminFederation := r.Group("/api/admin/federation")
-	adminFederation.Use(middleware.Auth(jwtManager, tokenBlacklist), middleware.AdminOnly())
+	adminFederation.Use(middleware.AuthWithOAuthRepo(jwtManager, oauthRepo, tokenBlacklist), middleware.CSRFProtectionWithRiskEventRepository(riskEventRepo), middleware.AdminOnly())
 	{
 		adminFederation.GET("/providers", federationHandler.AdminListProviders)
 		adminFederation.POST("/providers", federationHandler.AdminCreateProvider)
 		adminFederation.POST("/providers/:id", federationHandler.AdminUpdateProvider)
 		adminFederation.POST("/providers/:id/delete", federationHandler.AdminDeleteProvider)
+		adminFederation.GET("/ldap/providers", enterpriseSSOHandler.AdminListLDAPProviders)
+		adminFederation.POST("/ldap/providers", enterpriseSSOHandler.AdminCreateLDAPProvider)
+		adminFederation.POST("/ldap/providers/:id", enterpriseSSOHandler.AdminUpdateLDAPProvider)
+		adminFederation.POST("/ldap/providers/:id/delete", enterpriseSSOHandler.AdminDeleteLDAPProvider)
+		adminFederation.GET("/saml/providers", enterpriseSSOHandler.AdminListSAMLProviders)
+		adminFederation.POST("/saml/providers", enterpriseSSOHandler.AdminCreateSAMLProvider)
+		adminFederation.POST("/saml/providers/:id", enterpriseSSOHandler.AdminUpdateSAMLProvider)
+		adminFederation.POST("/saml/providers/:id/delete", enterpriseSSOHandler.AdminDeleteSAMLProvider)
+		adminFederation.POST("/saml/providers/:id/refresh-metadata", enterpriseSSOHandler.AdminRefreshSAMLMetadata)
 	}
 
 	// Public config endpoint
@@ -410,7 +452,7 @@ appRepo := repository.NewApplicationRepository(db)
 	events := r.Group("/api/events")
 	{
 		events.GET("/app", sseHandler.StreamApp)
-		events.GET("/stream", middleware.Auth(jwtManager, tokenBlacklist), sseHandler.Stream)
+		events.GET("/stream", middleware.AuthWithOAuthRepo(jwtManager, oauthRepo, tokenBlacklist), sseHandler.Stream)
 	}
 
 	// Avatar file serving
@@ -521,7 +563,7 @@ appRepo := repository.NewApplicationRepository(db)
 		})
 	}
 
-	return r, cleanupFn
+	return r, ldapSyncService, cleanupFn
 }
 
 // loadCustomEmailTemplates 从数据库加载自定义邮件模板

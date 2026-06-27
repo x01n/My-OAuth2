@@ -6,6 +6,7 @@ import Link from 'next/link';
 import { useAuth } from '@/lib/auth-context';
 import { useI18n } from '@/lib/i18n';
 import { api } from '@/lib/api';
+import { safeReturnPath } from '@/lib/redirect';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -37,7 +38,7 @@ function RegisterForm() {
   const [socialProviders, setSocialProviders] = useState<SocialProvider[]>([]);
   const [redirectUrl, setRedirectUrl] = useState<string | null>(null);
 
-  const returnTo = searchParams.get('return_to') || '/dashboard';
+  const returnTo = safeReturnPath(searchParams.get('return_to'));
 
   /* 已登录用户自动跳转 */
   useEffect(() => {

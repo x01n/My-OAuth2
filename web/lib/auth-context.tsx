@@ -12,28 +12,13 @@ interface AuthContextType {
   isLoading: boolean;
   isAuthenticated: boolean;
   login: (email: string, password: string) => Promise<{ success: boolean; error?: string }>;
+  loginWithLDAP: (providerSlug: string, identifier: string, password: string) => Promise<{ success: boolean; error?: string }>;
   register: (email: string, username: string, password: string) => Promise<{ success: boolean; error?: string }>;
   logout: () => Promise<void>;
-  refreshUser: () => Promise<void>;
+  refreshUser: () => Promise<boolean>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
-
-/**
- * 从 JWT payload 中解析过期时间（秒级时间戳）
- * 不依赖外部库，仅读取 exp 字段用于定时刷新
- */
-function getTokenExpiry(token: string | null): number | null {
-  if (!token) return null;
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
-    return typeof payload.exp === 'number' ? payload.exp : null;
-  } catch {
-    return null;
-  }
-}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
@@ -56,30 +41,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
    */
   const handleRefreshFailure = useCallback(async () => {
     const currentToken = api.getAccessToken();
-    if (currentToken) {
-      const profileRes = await api.getProfile();
-      if (profileRes.success && profileRes.data) {
-        setUser(profileRes.data);
-        scheduleRefreshRef.current();
-        return;
-      }
+    const profileRes = await api.getProfile();
+    if (profileRes.success && profileRes.data) {
+      setUser(profileRes.data);
+      if (currentToken) scheduleRefreshRef.current();
+      return;
     }
     setUser(null);
     api.setAccessToken(null);
-    if (typeof window !== 'undefined') {
-      localStorage.removeItem('refresh_token');
-    }
   }, []);
 
   /** 设置定时刷新：在 access token 过期前自动刷新 */
   const scheduleRefresh = useCallback(() => {
     clearRefreshTimer();
-    const token = api.getAccessToken();
-    const exp = getTokenExpiry(token);
-    if (!exp) return;
+    const expiresAt = api.getAccessTokenExpiresAt();
+    if (!expiresAt) return;
 
     const now = Date.now();
-    const expiresAt = exp * 1000;
     const delay = expiresAt - now - REFRESH_BEFORE_EXPIRY_MS;
 
     if (delay <= 0) {
@@ -117,12 +95,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible' && user) {
-        const token = api.getAccessToken();
-        const exp = getTokenExpiry(token);
-        if (!exp) return;
+        const expiresAt = api.getAccessTokenExpiresAt();
+        if (!expiresAt) return;
 
         const now = Date.now();
-        const expiresAt = exp * 1000;
         const remaining = expiresAt - now;
 
         if (remaining <= 0) {
@@ -153,21 +129,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [user, handleRefreshFailure]);
 
   const checkAuth = useCallback(async () => {
-    const token = api.getAccessToken();
-    const refreshToken = typeof window !== 'undefined' ? localStorage.getItem('refresh_token') : null;
-
-    if (!token && !refreshToken) {
-      setIsLoading(false);
-      return;
-    }
-
     /* 尝试用当前 token 获取用户信息（api client 内置自动刷新重试） */
     const response = await api.getProfile();
     if (response.success && response.data) {
       setUser(response.data);
       scheduleRefresh();
-    } else if (refreshToken) {
-      /* 显式尝试 refresh（处理 access_token 已丢失但 refresh_token 仍有效的情况） */
+    } else {
+      /* 显式尝试 refresh（处理 access_token 已丢失但 refresh_token cookie 仍有效的情况） */
       const refreshResponse = await api.refreshToken();
       if (refreshResponse.success) {
         const profileResponse = await api.getProfile();
@@ -177,9 +145,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
       } else {
         api.setAccessToken(null);
-        if (typeof window !== 'undefined') {
-          localStorage.removeItem('refresh_token');
-        }
       }
     }
     setIsLoading(false);
@@ -192,6 +157,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = async (email: string, password: string) => {
     const response = await api.login({ email, password });
+    if (response.success && response.data) {
+      setUser(response.data.user);
+      scheduleRefresh();
+      return { success: true };
+    }
+    return { success: false, error: response.error?.message || 'Login failed' };
+  };
+
+  const loginWithLDAP = async (providerSlug: string, identifier: string, password: string) => {
+    const response = await api.loginWithLDAP({ provider_slug: providerSlug, identifier, password });
     if (response.success && response.data) {
       setUser(response.data.user);
       scheduleRefresh();
@@ -219,7 +194,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const response = await api.getProfile();
     if (response.success && response.data) {
       setUser(response.data);
+      if (!api.getAccessToken()) {
+        await api.refreshToken();
+      }
+      scheduleRefresh();
+      return true;
     }
+    return false;
   };
 
   return (
@@ -229,6 +210,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         isLoading,
         isAuthenticated: !!user,
         login,
+        loginWithLDAP,
         register,
         logout,
         refreshUser,

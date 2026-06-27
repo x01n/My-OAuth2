@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import { useAuth } from '@/lib/auth-context';
 import { useI18n } from '@/lib/i18n';
 import { api } from '@/lib/api';
 import type { SystemConfig, SystemConfigUpdate } from '@/lib/types';
@@ -27,6 +28,7 @@ import {
 } from 'lucide-react';
 
 export default function SystemConfigPage() {
+  const { user } = useAuth();
   const { t } = useI18n();
   const [config, setConfig] = useState<SystemConfig | null>(null);
   const [loading, setLoading] = useState(true);
@@ -74,10 +76,13 @@ export default function SystemConfigPage() {
 
   const [savingGeneral, setSavingGeneral] = useState(false);
 
-  const loadConfig = useCallback(async () => {
+  const loadConfig = useCallback(async (ignoreResult?: () => boolean) => {
     setLoading(true);
     try {
       const response = await api.getSystemConfig();
+      if (ignoreResult?.()) {
+        return;
+      }
       if (response.success && response.data) {
         setConfig(response.data);
         // Initialize forms with loaded data
@@ -123,29 +128,51 @@ export default function SystemConfigPage() {
         }));
       }
     } catch {
+      if (ignoreResult?.()) {
+        return;
+      }
       setMessage({ type: 'error', text: t('admin.system.loadFailed') });
+    }
+    if (ignoreResult?.()) {
+      return;
     }
     setLoading(false);
   }, [t]);
 
   /* 从数据库加载站点配置（frontend_url、server_url、site_name） */
-  const loadSiteConfig = useCallback(async () => {
-    const response = await api.getAdminConfig();
-    if (response.success && response.data) {
-      const data = response.data;
-      setGeneralForm(prev => ({
-        ...prev,
-        frontend_url: data.frontend_url || '',
-        server_url: data.server_url || '',
-        site_name: data.site_name || '',
-      }));
+  const loadSiteConfig = useCallback(async (ignoreResult?: () => boolean) => {
+    try {
+      const response = await api.getAdminConfig();
+      if (ignoreResult?.()) {
+        return;
+      }
+      if (response.success && response.data) {
+        const data = response.data;
+        setGeneralForm(prev => ({
+          ...prev,
+          frontend_url: data.frontend_url || '',
+          server_url: data.server_url || '',
+          site_name: data.site_name || '',
+        }));
+      }
+    } catch {
+      return;
     }
   }, []);
 
   useEffect(() => {
-    loadConfig();
-    loadSiteConfig();
-  }, [loadConfig, loadSiteConfig]);
+    if (user?.role === 'admin') {
+      let ignore = false;
+      loadConfig(() => ignore);
+      loadSiteConfig(() => ignore);
+      return () => {
+        ignore = true;
+      };
+    }
+    if (user?.role === 'user') {
+      setLoading(false);
+    }
+  }, [user, loadConfig, loadSiteConfig]);
 
   const handleSave = async (section: string, data: SystemConfigUpdate) => {
     setSaving(true);
@@ -185,6 +212,14 @@ export default function SystemConfigPage() {
     setSaving(false);
   };
 
+  if (user?.role !== 'admin') {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <p className="text-muted-foreground">{t('errors.forbidden')}</p>
+      </div>
+    );
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -203,7 +238,7 @@ export default function SystemConfigPage() {
           </h1>
           <p className="text-muted-foreground mt-1 text-sm">{t('admin.system.description')}</p>
         </div>
-        <Button variant="outline" onClick={loadConfig} disabled={loading} className="w-full sm:w-auto">
+        <Button variant="outline" onClick={() => loadConfig()} disabled={loading} className="w-full sm:w-auto">
           <RefreshCw className={`h-4 w-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
           {t('admin.system.refresh')}
         </Button>

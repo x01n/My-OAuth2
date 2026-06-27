@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"server/internal/model"
 	"server/internal/repository"
 	"server/pkg/jwt"
+	"server/pkg/logger"
 
 	"github.com/google/uuid"
 )
@@ -33,6 +35,15 @@ var (
 	/** scope 超出允许范围 */
 	ErrInvalidScope = errors.New("invalid scope")
 
+	/** OAuth grant_type 不受支持 */
+	ErrUnsupportedGrantType = errors.New("unsupported grant type")
+
+	/** OAuth 请求参数缺失或不合法 */
+	ErrInvalidRequest = errors.New("invalid request")
+
+	/** 请求的 audience/resource 目标不可签发 */
+	ErrInvalidTarget = errors.New("invalid target")
+
 	/** 授权码已过期 */
 	ErrAuthCodeExpired = errors.New("authorization code expired")
 
@@ -41,6 +52,12 @@ var (
 
 	/** PKCE code_verifier 不匹配 */
 	ErrInvalidCodeVerifier = errors.New("invalid code verifier")
+
+	/** OIDC max_age 要求重新认证 */
+	ErrLoginRequired = errors.New("login required")
+
+	/** OIDC prompt=none 无法静默完成授权同意 */
+	ErrConsentRequired = errors.New("consent required")
 
 	/** access token 已过期 */
 	ErrTokenExpired = errors.New("token expired")
@@ -68,19 +85,96 @@ func splitScopeSet(scope string) map[string]bool {
 	return set
 }
 
+func parseOIDCMaxAge(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return -1, nil
+	}
+	maxAge, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || maxAge < 0 {
+		return 0, ErrInvalidRequest
+	}
+	return maxAge, nil
+}
+
+func isFreshOIDCSession(authTime int64, maxAge int64) bool {
+	if maxAge < 0 {
+		return true
+	}
+	if authTime <= 0 {
+		return false
+	}
+	return time.Since(time.Unix(authTime, 0)) <= time.Duration(maxAge)*time.Second
+}
+
+type oidcPrompt struct {
+	None    bool
+	Login   bool
+	Consent bool
+}
+
+func parseOIDCPrompt(raw string) (oidcPrompt, error) {
+	var prompt oidcPrompt
+	seen := make(map[string]bool)
+	for _, value := range strings.Fields(raw) {
+		if seen[value] {
+			return prompt, ErrInvalidRequest
+		}
+		seen[value] = true
+		switch value {
+		case "none":
+			prompt.None = true
+		case "login":
+			prompt.Login = true
+		case "consent":
+			prompt.Consent = true
+		case "select_account":
+			return prompt, ErrInvalidRequest
+		default:
+			return prompt, ErrInvalidRequest
+		}
+	}
+	if prompt.None && len(seen) > 1 {
+		return prompt, ErrInvalidRequest
+	}
+	return prompt, nil
+}
+
+func scopeCovers(grantedScope, requestedScope string) bool {
+	granted := splitScopeSet(grantedScope)
+	for _, scope := range strings.Fields(requestedScope) {
+		if !granted[scope] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *OAuthService) hasReusableUserAuthorization(userID, appID uuid.UUID, requestedScope string) bool {
+	if s.userAuthRepo == nil {
+		return false
+	}
+	auth, err := s.userAuthRepo.FindByUserAndApp(userID, appID)
+	if err != nil || auth == nil || !auth.IsValid() {
+		return false
+	}
+	return scopeCovers(auth.Scope, requestedScope)
+}
+
 /*
  * OAuthService OAuth2 核心服务
  * 功能：实现 OAuth2 授权码流程、Token 签发/刷新/撤销、PKCE 校验、
  *       Client Credentials 授权、Device Flow、Token Introspection 等
  */
 type OAuthService struct {
-	appRepo      *repository.ApplicationRepository
-	oauthRepo    *repository.OAuthRepository
-	userRepo     *repository.UserRepository
-	userAuthRepo *repository.UserAuthorizationRepository
-	deviceRepo   *repository.DeviceCodeRepository
-	jwtManager   *jwt.Manager
-	config       *config.Config
+	appRepo       *repository.ApplicationRepository
+	oauthRepo     *repository.OAuthRepository
+	userRepo      *repository.UserRepository
+	userAuthRepo  *repository.UserAuthorizationRepository
+	riskEventRepo *repository.RiskEventRepository
+	deviceRepo    *repository.DeviceCodeRepository
+	jwtManager    *jwt.Manager
+	config        *config.Config
 }
 
 /*
@@ -112,6 +206,27 @@ func (s *OAuthService) SetDeviceCodeRepository(repo *repository.DeviceCodeReposi
 	s.deviceRepo = repo
 }
 
+/* SetRiskEventRepository 注入风控事件仓储（可选依赖） */
+func (s *OAuthService) SetRiskEventRepository(repo *repository.RiskEventRepository) {
+	s.riskEventRepo = repo
+}
+
+func (s *OAuthService) recordRiskEvent(userID *uuid.UUID, riskScore int, decision model.RiskDecision, ipAddress, userAgent, reason string) {
+	if s.riskEventRepo == nil {
+		return
+	}
+	if err := s.riskEventRepo.Create(&model.RiskEvent{
+		UserID:    userID,
+		RiskScore: riskScore,
+		Decision:  decision,
+		IPAddress: ipAddress,
+		UserAgent: userAgent,
+		Reason:    reason,
+	}); err != nil {
+		logger.Warn("Failed to record OAuth risk event", "user_id", userID, "risk_score", riskScore, "decision", decision, "reason", reason, "error", err)
+	}
+}
+
 /* AuthorizeInput OAuth2 授权请求参数，支持 PKCE */
 type AuthorizeInput struct {
 	ClientID            string
@@ -119,6 +234,11 @@ type AuthorizeInput struct {
 	ResponseType        string
 	Scope               string
 	State               string
+	Nonce               string
+	MaxAge              string
+	Prompt              string
+	AuthTime            int64
+	AMR                 []string
 	CodeChallenge       string
 	CodeChallengeMethod string
 	UserID              uuid.UUID
@@ -184,8 +304,34 @@ func (s *OAuthService) Authorize(input *AuthorizeInput) (*AuthorizeResult, error
 		}
 	}
 
+	prompt, err := parseOIDCPrompt(input.Prompt)
+	if err != nil {
+		return nil, ErrInvalidRequest
+	}
+	if prompt.Login {
+		return nil, ErrLoginRequired
+	}
+	if prompt.Consent && prompt.None {
+		return nil, ErrInvalidRequest
+	}
+	if prompt.None && !s.hasReusableUserAuthorization(input.UserID, app.ID, input.Scope) {
+		return nil, ErrConsentRequired
+	}
+
+	maxAge, err := parseOIDCMaxAge(input.MaxAge)
+	if err != nil {
+		return nil, ErrInvalidRequest
+	}
+	if maxAge >= 0 && !isFreshOIDCSession(input.AuthTime, maxAge) {
+		return nil, ErrLoginRequired
+	}
+	authTime := input.AuthTime
+	if authTime <= 0 {
+		authTime = time.Now().Unix()
+	}
+
 	if existing, err := s.oauthRepo.FindReusableAuthorizationCode(
-		input.UserID, input.ClientID, input.RedirectURI, input.Scope, input.CodeChallenge,
+		input.UserID, input.ClientID, input.RedirectURI, input.Scope, input.CodeChallenge, input.Nonce, maxAge,
 	); err == nil && existing != nil {
 		return &AuthorizeResult{
 			Code:        existing.Code,
@@ -200,6 +346,10 @@ func (s *OAuthService) Authorize(input *AuthorizeInput) (*AuthorizeResult, error
 		UserID:              input.UserID,
 		RedirectURI:         input.RedirectURI,
 		Scope:               input.Scope,
+		Nonce:               input.Nonce,
+		AuthTime:            authTime,
+		AMR:                 encodeAMR(input.AMR),
+		MaxAge:              maxAge,
 		CodeChallenge:       input.CodeChallenge,
 		CodeChallengeMethod: input.CodeChallengeMethod,
 		ExpiresAt:           time.Now().Add(s.config.OAuth.AuthCodeTTL),
@@ -209,7 +359,7 @@ func (s *OAuthService) Authorize(input *AuthorizeInput) (*AuthorizeResult, error
 		return nil, err
 	}
 
-	if s.userAuthRepo != nil {
+	if s.userAuthRepo != nil && !prompt.None {
 		s.userAuthRepo.CreateOrUpdate(input.UserID, app.ID, input.Scope, "authorization_code")
 	}
 
@@ -225,18 +375,45 @@ func (s *OAuthService) Authorize(input *AuthorizeInput) (*AuthorizeResult, error
  * FindPendingAuthorization 查找可复用的授权码（授权页加载时用于自动跳转）
  */
 func (s *OAuthService) FindPendingAuthorization(input *AuthorizeInput) (*AuthorizeResult, error) {
-	existing, err := s.oauthRepo.FindReusableAuthorizationCode(
-		input.UserID, input.ClientID, input.RedirectURI, input.Scope, input.CodeChallenge,
-	)
+	app, err := s.appRepo.FindByClientID(input.ClientID)
 	if err != nil {
-		return nil, err
+		return nil, ErrInvalidClient
 	}
-	return &AuthorizeResult{
-		Code:        existing.Code,
-		RedirectURI: input.RedirectURI,
-		State:       input.State,
-		Reused:      true,
-	}, nil
+	prompt, err := parseOIDCPrompt(input.Prompt)
+	if err != nil {
+		return nil, ErrInvalidRequest
+	}
+	if prompt.Login {
+		return nil, ErrLoginRequired
+	}
+	maxAge, err := parseOIDCMaxAge(input.MaxAge)
+	if err != nil {
+		return nil, ErrInvalidRequest
+	}
+	if maxAge >= 0 && !isFreshOIDCSession(input.AuthTime, maxAge) {
+		return nil, ErrLoginRequired
+	}
+	if prompt.None && !s.hasReusableUserAuthorization(input.UserID, app.ID, input.Scope) {
+		return nil, ErrConsentRequired
+	}
+	existing, err := s.oauthRepo.FindReusableAuthorizationCode(
+		input.UserID, input.ClientID, input.RedirectURI, input.Scope, input.CodeChallenge, input.Nonce, maxAge,
+	)
+	if err == nil {
+		return &AuthorizeResult{
+			Code:        existing.Code,
+			RedirectURI: input.RedirectURI,
+			State:       input.State,
+			Reused:      true,
+		}, nil
+	}
+	if !prompt.Consent && s.hasReusableUserAuthorization(input.UserID, app.ID, input.Scope) {
+		return s.Authorize(input)
+	}
+	if prompt.None {
+		return s.Authorize(input)
+	}
+	return nil, err
 }
 
 /*
@@ -251,6 +428,9 @@ type TokenInput struct {
 	ClientID     string
 	ClientSecret string
 	RefreshToken string
+	Issuer       string
+	IPAddress    string
+	UserAgent    string
 	CodeVerifier string
 	Scope        string // For client_credentials grant
 	DeviceCode   string // For device_code grant
@@ -266,12 +446,13 @@ type TokenInput struct {
 
 /* TokenResult OAuth2/OIDC Token 响应结构（RFC 6749 + OIDC） */
 type TokenResult struct {
-	AccessToken  string `json:"access_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int64  `json:"expires_in"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	IDToken      string `json:"id_token,omitempty"`
-	Scope        string `json:"scope,omitempty"`
+	AccessToken     string `json:"access_token"`
+	TokenType       string `json:"token_type"`
+	ExpiresIn       int64  `json:"expires_in"`
+	RefreshToken    string `json:"refresh_token,omitempty"`
+	IDToken         string `json:"id_token,omitempty"`
+	Scope           string `json:"scope,omitempty"`
+	IssuedTokenType string `json:"issued_token_type,omitempty"`
 }
 
 /*
@@ -282,6 +463,10 @@ type TokenResult struct {
  * @return *TokenResult - 令牌响应
  */
 func (s *OAuthService) Token(input *TokenInput) (*TokenResult, error) {
+	if input.GrantType == "" {
+		return nil, ErrInvalidRequest
+	}
+
 	switch input.GrantType {
 	case "authorization_code":
 		return s.exchangeAuthorizationCode(input)
@@ -294,7 +479,7 @@ func (s *OAuthService) Token(input *TokenInput) (*TokenResult, error) {
 	case "urn:ietf:params:oauth:grant-type:token-exchange":
 		return s.tokenExchange(input)
 	default:
-		return nil, ErrInvalidGrant
+		return nil, ErrUnsupportedGrantType
 	}
 }
 
@@ -351,6 +536,10 @@ func (s *OAuthService) exchangeAuthorizationCode(input *TokenInput) (*TokenResul
 		return nil, ErrInvalidRedirectURI
 	}
 
+	if app.AppType == model.AppTypePublic && authCode.CodeChallenge == "" {
+		return nil, ErrInvalidCodeVerifier
+	}
+
 	// Validate PKCE code verifier
 	if authCode.CodeChallenge != "" {
 		if !s.validateCodeVerifier(input.CodeVerifier, authCode.CodeChallenge, authCode.CodeChallengeMethod) {
@@ -385,10 +574,12 @@ func (s *OAuthService) exchangeAuthorizationCode(input *TokenInput) (*TokenResul
 		ClientID:  input.ClientID,
 		UserID:    &authCode.UserID,
 		Scope:     authCode.Scope,
+		AuthTime:  authCode.AuthTime,
+		AMR:       authCode.AMR,
 		ExpiresAt: time.Now().Add(s.config.OAuth.AccessTokenTTL),
 	}
 
-	if err := s.persistUserAccessToken(accessToken, user); err != nil {
+	if err := s.persistUserAccessToken(accessToken, user, authCode.AuthTime, decodeAMR(authCode.AMR)); err != nil {
 		return nil, err
 	}
 
@@ -399,7 +590,7 @@ func (s *OAuthService) exchangeAuthorizationCode(input *TokenInput) (*TokenResul
 		ExpiresAt:     time.Now().Add(s.config.OAuth.RefreshTokenTTL),
 	}
 
-	if err := s.persistUserRefreshToken(refreshToken, user, input.ClientID, authCode.Scope); err != nil {
+	if err := s.persistUserRefreshToken(refreshToken, user, input.ClientID, authCode.Scope, authCode.AuthTime, decodeAMR(authCode.AMR)); err != nil {
 		return nil, err
 	}
 
@@ -410,7 +601,7 @@ func (s *OAuthService) exchangeAuthorizationCode(input *TokenInput) (*TokenResul
 		RefreshToken: refreshToken.Token,
 		Scope:        authCode.Scope,
 	}
-	if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, authCode.Scope); err != nil {
+	if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, input.Issuer, authCode.Scope, authCode.Nonce, authCode.AuthTime, decodeAMR(authCode.AMR)); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -436,11 +627,15 @@ func (s *OAuthService) refreshAccessToken(input *TokenInput) (*TokenResult, erro
 	 * 安全措施：撤销该 refresh_token 关联的所有令牌（整个 token family）
 	 */
 	if refreshToken.Revoked {
+		s.recordRiskEvent(refreshToken.UserID, 80, model.RiskDecisionBlock, input.IPAddress, input.UserAgent, model.RiskEventReasonRefreshTokenReplay)
 		if refreshToken.AccessTokenID != nil {
 			if at, atErr := s.oauthRepo.FindAccessTokenByID(*refreshToken.AccessTokenID); atErr == nil {
-				/* 撤销 family：同一 client + user 的所有未过期令牌 */
-				s.oauthRepo.RevokeAccessToken(at.Token)
-				s.oauthRepo.RevokeRefreshTokenByAccessTokenID(at.ID)
+				if at.UserID != nil {
+					_ = s.oauthRepo.RevokeTokensByClientAndUser(at.ClientID, *at.UserID)
+				} else {
+					_ = s.oauthRepo.RevokeAccessToken(at.Token)
+					_ = s.oauthRepo.RevokeRefreshTokenByAccessTokenID(at.ID)
+				}
 			}
 		}
 		return nil, ErrTokenRevoked
@@ -504,15 +699,23 @@ func (s *OAuthService) refreshAccessToken(input *TokenInput) (*TokenResult, erro
 	}
 	s.oauthRepo.RevokeAccessToken(oldAccessToken.Token)
 
+	authTime := oldAccessToken.AuthTime
+	if authTime <= 0 {
+		authTime = time.Now().Unix()
+	}
+	amr := decodeAMR(oldAccessToken.AMR)
+
 	// Create new access token
 	accessToken := &model.AccessToken{
 		ClientID:  oldAccessToken.ClientID,
 		UserID:    oldAccessToken.UserID,
 		Scope:     oldAccessToken.Scope,
+		AuthTime:  authTime,
+		AMR:       oldAccessToken.AMR,
 		ExpiresAt: time.Now().Add(s.config.OAuth.AccessTokenTTL),
 	}
 
-	if err := s.persistUserAccessToken(accessToken, user); err != nil {
+	if err := s.persistUserAccessToken(accessToken, user, authTime, amr); err != nil {
 		return nil, err
 	}
 
@@ -522,7 +725,7 @@ func (s *OAuthService) refreshAccessToken(input *TokenInput) (*TokenResult, erro
 		ExpiresAt:     time.Now().Add(s.config.OAuth.RefreshTokenTTL),
 	}
 
-	if err := s.persistUserRefreshToken(newRefreshToken, user, oldAccessToken.ClientID, oldAccessToken.Scope); err != nil {
+	if err := s.persistUserRefreshToken(newRefreshToken, user, oldAccessToken.ClientID, oldAccessToken.Scope, authTime, amr); err != nil {
 		return nil, err
 	}
 
@@ -534,7 +737,7 @@ func (s *OAuthService) refreshAccessToken(input *TokenInput) (*TokenResult, erro
 		Scope:        oldAccessToken.Scope,
 	}
 	if user != nil {
-		if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, oldAccessToken.Scope); err != nil {
+		if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, input.Issuer, oldAccessToken.Scope, "", authTime, amr); err != nil {
 			return nil, err
 		}
 	}
@@ -693,15 +896,18 @@ func (s *OAuthService) deviceCodeGrant(input *TokenInput) (*TokenResult, error) 
 		return nil, ErrInvalidScope
 	}
 
+	authTime := time.Now().Unix()
+
 	// Create access token
 	accessToken := &model.AccessToken{
 		ClientID:  input.ClientID,
 		UserID:    &user.ID,
 		Scope:     dc.Scope,
+		AuthTime:  authTime,
 		ExpiresAt: time.Now().Add(s.config.OAuth.AccessTokenTTL),
 	}
 
-	if err := s.persistUserAccessToken(accessToken, user); err != nil {
+	if err := s.persistUserAccessToken(accessToken, user, authTime, nil); err != nil {
 		return nil, err
 	}
 
@@ -711,7 +917,7 @@ func (s *OAuthService) deviceCodeGrant(input *TokenInput) (*TokenResult, error) 
 		ExpiresAt:     time.Now().Add(s.config.OAuth.RefreshTokenTTL),
 	}
 
-	if err := s.persistUserRefreshToken(refreshToken, user, input.ClientID, dc.Scope); err != nil {
+	if err := s.persistUserRefreshToken(refreshToken, user, input.ClientID, dc.Scope, authTime, nil); err != nil {
 		return nil, err
 	}
 
@@ -730,7 +936,7 @@ func (s *OAuthService) deviceCodeGrant(input *TokenInput) (*TokenResult, error) 
 		RefreshToken: refreshToken.Token,
 		Scope:        dc.Scope,
 	}
-	if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, dc.Scope); err != nil {
+	if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, input.Issuer, dc.Scope, "", authTime, nil); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -757,17 +963,32 @@ type TokenExchangeResult struct {
  * @param input - Token 请求参数（需包含 SubjectToken 和 SubjectTokenType）
  */
 func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
-	// Validate required parameters
-	if input.SubjectToken == "" {
-		return nil, errors.New("subject_token is required")
+	if input.SubjectToken == "" || input.SubjectTokenType == "" {
+		return nil, ErrInvalidRequest
 	}
-	if input.SubjectTokenType == "" {
-		input.SubjectTokenType = TokenTypeAccessToken // Default to access_token
+	if input.ActorToken == "" && input.ActorTokenType != "" {
+		return nil, ErrInvalidRequest
+	}
+	if input.ActorToken != "" && input.ActorTokenType == "" {
+		return nil, ErrInvalidRequest
+	}
+
+	requestedType := input.RequestedTokenType
+	if requestedType == "" {
+		requestedType = TokenTypeAccessToken
+	}
+	switch requestedType {
+	case TokenTypeAccessToken, "access_token":
+		requestedType = TokenTypeAccessToken
+	case TokenTypeRefreshToken, "refresh_token":
+		requestedType = TokenTypeRefreshToken
+	default:
+		return nil, ErrInvalidRequest
 	}
 
 	/*
 	 * 强制要求客户端认证（RFC 8693 安全要求）
-	 * 安全加固（M-4）：禁止 public 应用使用 token-exchange — 公开客户端无法安全持有 secret，
+	 * 安全加固（M-4）：禁止 public 应用使用 token-exchange；公开客户端无法安全持有 secret，
 	 * 不应被赋予委托/降权能力，否则会被前端 XSS / 移动端逆向直接利用。
 	 */
 	if input.ClientID == "" {
@@ -791,15 +1012,22 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 	if !app.SupportsGrantType("token_exchange") {
 		return nil, ErrInvalidGrant
 	}
+	if requestedType == TokenTypeRefreshToken && !app.SupportsGrantType("refresh_token") {
+		return nil, ErrInvalidGrant
+	}
 
-	// Validate subject token based on type
+	if input.Audience != "" || input.Resource != "" {
+		return nil, ErrInvalidTarget
+	}
+
 	var user *model.User
 	var originalScope string
 	var subjectClientID string /* 持有 subject_token 的原 client_id（用于 C-3 跨 client 校验） */
+	var authTime int64
+	var amr []string
 
 	switch input.SubjectTokenType {
 	case TokenTypeAccessToken, "access_token":
-		// Validate as access token
 		u, accessToken, err := s.ValidateAccessToken(input.SubjectToken)
 		if err != nil {
 			return nil, ErrInvalidGrant
@@ -811,9 +1039,10 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 		user = u
 		originalScope = accessToken.Scope
 		subjectClientID = accessToken.ClientID
+		authTime = accessToken.AuthTime
+		amr = decodeAMR(accessToken.AMR)
 
 	case TokenTypeRefreshToken, "refresh_token":
-		// Validate as refresh token
 		refreshToken, err := s.oauthRepo.FindRefreshToken(input.SubjectToken)
 		if err != nil || !refreshToken.IsValid() {
 			return nil, ErrInvalidGrant
@@ -834,9 +1063,11 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 		}
 		originalScope = accessToken.Scope
 		subjectClientID = accessToken.ClientID
+		authTime = accessToken.AuthTime
+		amr = decodeAMR(accessToken.AMR)
 
 	default:
-		return nil, errors.New("unsupported subject_token_type")
+		return nil, ErrInvalidRequest
 	}
 
 	/*
@@ -850,19 +1081,22 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 	if user.IsSuspended() {
 		return nil, ErrAccessDenied
 	}
+	if authTime <= 0 {
+		authTime = time.Now().Unix()
+	}
 
-	// Validate actor token if provided (delegation scenario)
 	if input.ActorToken != "" {
-		// For now, we just validate the actor token exists and is valid
-		// More complex delegation logic can be added here
 		switch input.ActorTokenType {
-		case TokenTypeAccessToken, "access_token", "":
-			_, _, err := s.ValidateAccessToken(input.ActorToken)
+		case TokenTypeAccessToken, "access_token":
+			_, actorAccessToken, err := s.ValidateAccessToken(input.ActorToken)
 			if err != nil {
-				return nil, errors.New("invalid actor_token")
+				return nil, ErrInvalidGrant
+			}
+			if actorAccessToken == nil || !actorAccessToken.HasEndUser() || actorAccessToken.ClientID != input.ClientID {
+				return nil, ErrInvalidGrant
 			}
 		default:
-			return nil, errors.New("unsupported actor_token_type")
+			return nil, ErrInvalidRequest
 		}
 	}
 
@@ -891,27 +1125,21 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 		}
 	}
 
-	// Determine the issued token type
-	requestedType := input.RequestedTokenType
-	if requestedType == "" {
-		requestedType = TokenTypeAccessToken
-	}
-
-	// Create new access token
 	newAccessToken := &model.AccessToken{
 		ClientID:  input.ClientID,
 		Scope:     scope,
+		AuthTime:  authTime,
+		AMR:       encodeAMR(amr),
 		ExpiresAt: time.Now().Add(s.config.OAuth.AccessTokenTTL),
 	}
 	if user != nil {
 		newAccessToken.UserID = &user.ID
 	}
 
-	if err := s.persistUserAccessToken(newAccessToken, user); err != nil {
+	if err := s.persistUserAccessToken(newAccessToken, user, authTime, amr); err != nil {
 		return nil, err
 	}
 
-	// Create refresh token if requested
 	var newRefreshToken *model.RefreshToken
 	if requestedType == TokenTypeRefreshToken {
 		newRefreshToken = &model.RefreshToken{
@@ -919,16 +1147,17 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 			UserID:        newAccessToken.UserID,
 			ExpiresAt:     time.Now().Add(s.config.OAuth.RefreshTokenTTL),
 		}
-		if err := s.persistUserRefreshToken(newRefreshToken, user, input.ClientID, scope); err != nil {
+		if err := s.persistUserRefreshToken(newRefreshToken, user, input.ClientID, scope, authTime, amr); err != nil {
 			return nil, err
 		}
 	}
 
 	result := &TokenResult{
-		AccessToken: newAccessToken.Token,
-		TokenType:   "Bearer",
-		ExpiresIn:   int64(s.config.OAuth.AccessTokenTTL.Seconds()),
-		Scope:       scope,
+		AccessToken:     newAccessToken.Token,
+		TokenType:       "Bearer",
+		ExpiresIn:       int64(s.config.OAuth.AccessTokenTTL.Seconds()),
+		Scope:           scope,
+		IssuedTokenType: requestedType,
 	}
 
 	if newRefreshToken != nil {
@@ -936,7 +1165,7 @@ func (s *OAuthService) tokenExchange(input *TokenInput) (*TokenResult, error) {
 	}
 
 	if user != nil {
-		if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, scope); err != nil {
+		if err := s.enrichTokenResultWithIDToken(result, user, input.ClientID, input.Issuer, scope, "", authTime, amr); err != nil {
 			return nil, err
 		}
 	}
@@ -994,47 +1223,127 @@ func (s *OAuthService) ValidateAccessToken(token string) (*model.User, *model.Ac
  * @param tokenTypeHint - 令牌类型提示 (access_token / refresh_token)
  */
 func (s *OAuthService) RevokeToken(token, tokenTypeHint string) error {
-	switch tokenTypeHint {
-	case "access_token":
-		/* 撤销 access_token 并同时撤销其关联的 refresh_token */
+	return s.revokeToken(token, tokenTypeHint, "")
+}
+
+func (s *OAuthService) RevokeTokenForClient(token, tokenTypeHint, clientID, clientSecret string) error {
+	app, err := s.appRepo.FindByClientID(clientID)
+	if err != nil {
+		return ErrInvalidClient
+	}
+	if app.AppType == model.AppTypeConfidential || app.AppType == model.AppTypeMachine {
+		if clientSecret == "" || subtle.ConstantTimeCompare([]byte(app.ClientSecret), []byte(clientSecret)) != 1 {
+			return ErrInvalidClient
+		}
+	} else if clientSecret != "" {
+		if subtle.ConstantTimeCompare([]byte(app.ClientSecret), []byte(clientSecret)) != 1 {
+			return ErrInvalidClient
+		}
+	}
+
+	ownerClientID, err := s.tokenOwnerClientID(token, tokenTypeHint)
+	if err != nil {
+		return err
+	}
+	if ownerClientID != clientID {
+		return nil
+	}
+	return s.revokeToken(token, tokenTypeHint, clientID)
+}
+
+func (s *OAuthService) tokenOwnerClientID(token, tokenTypeHint string) (string, error) {
+	findAccessTokenOwner := func() (string, bool) {
 		at, err := s.oauthRepo.FindAccessToken(token)
 		if err != nil {
-			return err
+			return "", false
+		}
+		return at.ClientID, true
+	}
+
+	findRefreshTokenOwner := func() (string, bool) {
+		rt, err := s.oauthRepo.FindRefreshToken(token)
+		if err != nil || rt.AccessTokenID == nil {
+			return "", false
+		}
+		at, err := s.oauthRepo.FindAccessTokenByID(*rt.AccessTokenID)
+		if err != nil {
+			return "", false
+		}
+		return at.ClientID, true
+	}
+
+	switch tokenTypeHint {
+	case "access_token":
+		if clientID, ok := findAccessTokenOwner(); ok {
+			return clientID, nil
+		}
+		if clientID, ok := findRefreshTokenOwner(); ok {
+			return clientID, nil
+		}
+	case "refresh_token":
+		if clientID, ok := findRefreshTokenOwner(); ok {
+			return clientID, nil
+		}
+		if clientID, ok := findAccessTokenOwner(); ok {
+			return clientID, nil
+		}
+	default:
+		if clientID, ok := findAccessTokenOwner(); ok {
+			return clientID, nil
+		}
+		if clientID, ok := findRefreshTokenOwner(); ok {
+			return clientID, nil
+		}
+	}
+	return "", ErrTokenExpired
+}
+
+func (s *OAuthService) revokeToken(token, tokenTypeHint, clientID string) error {
+	revokeAccessToken := func() bool {
+		at, err := s.oauthRepo.FindAccessToken(token)
+		if err != nil {
+			return false
+		}
+		if clientID != "" && at.ClientID != clientID {
+			return true
 		}
 		_ = s.oauthRepo.RevokeAccessToken(token)
 		_ = s.oauthRepo.RevokeRefreshTokenByAccessTokenID(at.ID)
-		return nil
-	case "refresh_token":
-		/* 撤销 refresh_token 并同时撤销其关联的 access_token */
+		return true
+	}
+
+	revokeRefreshToken := func() bool {
 		rt, err := s.oauthRepo.FindRefreshToken(token)
 		if err != nil {
-			return err
+			return false
 		}
-		_, _ = s.oauthRepo.RevokeRefreshToken(token)
 		if rt.AccessTokenID != nil {
 			if at, atErr := s.oauthRepo.FindAccessTokenByID(*rt.AccessTokenID); atErr == nil {
+				if clientID != "" && at.ClientID != clientID {
+					return true
+				}
 				_ = s.oauthRepo.RevokeAccessToken(at.Token)
 			}
 		}
-		return nil
-	default:
-		/* 未指定类型，先尝试 access_token 再尝试 refresh_token */
-		if at, err := s.oauthRepo.FindAccessToken(token); err == nil {
-			_ = s.oauthRepo.RevokeAccessToken(token)
-			_ = s.oauthRepo.RevokeRefreshTokenByAccessTokenID(at.ID)
-			return nil
-		}
-		if rt, err := s.oauthRepo.FindRefreshToken(token); err == nil {
-			_, _ = s.oauthRepo.RevokeRefreshToken(token)
-			if rt.AccessTokenID != nil {
-				if at, atErr := s.oauthRepo.FindAccessTokenByID(*rt.AccessTokenID); atErr == nil {
-					_ = s.oauthRepo.RevokeAccessToken(at.Token)
-				}
-			}
-			return nil
-		}
-		return ErrTokenExpired
+		_, _ = s.oauthRepo.RevokeRefreshToken(token)
+		return true
 	}
+
+	switch tokenTypeHint {
+	case "access_token":
+		if revokeAccessToken() || revokeRefreshToken() {
+			return nil
+		}
+	case "refresh_token":
+		if revokeRefreshToken() || revokeAccessToken() {
+			return nil
+		}
+	default:
+		if revokeAccessToken() || revokeRefreshToken() {
+			return nil
+		}
+	}
+	return ErrTokenExpired
 }
 
 /*
@@ -1054,6 +1363,9 @@ func (s *OAuthService) GetUserInfoWithScope(token string) (*model.User, string, 
 	scope := ""
 	if accessToken != nil {
 		scope = accessToken.Scope
+	}
+	if !model.ScopeContainsOpenID(scope) {
+		return nil, "", ErrInvalidScope
 	}
 	return user, scope, nil
 }
@@ -1169,75 +1481,95 @@ func (s *OAuthService) IntrospectToken(token, clientID, clientSecret, tokenTypeH
 		}
 	}
 
-	/**
-	 * minimalActive 跨 client 探测时返回的最小响应（仅证实 token 是否活跃）
-	 * @returns {map[string]interface{}}
-	 */
-	minimalActive := func(expUnix int64) map[string]interface{} {
-		return map[string]interface{}{
-			"active": true,
-			"exp":    expUnix,
-		}
+	inactive := func() map[string]interface{} {
+		return map[string]interface{}{"active": false}
 	}
 
-	// 尝试验证为access_token
-	if tokenTypeHint == "" || tokenTypeHint == "access_token" {
+	introspectAccessToken := func() (map[string]interface{}, bool) {
 		user, accessToken, err := s.ValidateAccessToken(token)
-		if err == nil && accessToken != nil {
-			/* H-3 跨 client 保护：调用方不是 token 所属 client 时只返回最小信息 */
-			if accessToken.ClientID != clientID {
-				return minimalActive(accessToken.ExpiresAt.Unix()), nil
-			}
-			result := map[string]interface{}{
-				"active":     true,
-				"scope":      accessToken.Scope,
-				"client_id":  accessToken.ClientID,
-				"token_type": "Bearer",
-				"exp":        accessToken.ExpiresAt.Unix(),
-				"iat":        accessToken.CreatedAt.Unix(),
-				"aud":        accessToken.ClientID,
-				"iss":        s.config.JWT.Issuer,
-			}
-			/* 有用户关联时补充用户字段（client_credentials 模式无用户） */
-			if user != nil {
-				result["sub"] = user.ID.String()
-				result["username"] = user.Username
-				result["email"] = user.Email
-				result["email_verified"] = user.EmailVerified
-			}
+		if err != nil || accessToken == nil {
+			return nil, false
+		}
+		/* RFC 7662 active=false：调用方不被允许内省该 token 时不泄露活跃状态 */
+		if accessToken.ClientID != clientID {
+			return inactive(), true
+		}
+		result := map[string]interface{}{
+			"active":     true,
+			"scope":      accessToken.Scope,
+			"client_id":  accessToken.ClientID,
+			"token_type": "Bearer",
+			"exp":        accessToken.ExpiresAt.Unix(),
+			"iat":        accessToken.CreatedAt.Unix(),
+			"aud":        accessToken.ClientID,
+			"iss":        s.config.JWT.Issuer,
+		}
+		/* 有用户关联时补充用户字段（client_credentials 模式无用户） */
+		if user != nil {
+			result["sub"] = user.ID.String()
+			result["username"] = user.Username
+			result["email"] = user.Email
+			result["email_verified"] = user.EmailVerified
+		}
+		return result, true
+	}
+
+	introspectRefreshToken := func() (map[string]interface{}, bool) {
+		refreshToken, err := s.oauthRepo.FindRefreshToken(token)
+		if err != nil || refreshToken == nil || !refreshToken.ExpiresAt.After(time.Now()) || refreshToken.Revoked {
+			return nil, false
+		}
+		var accessToken *model.AccessToken
+		if refreshToken.AccessTokenID != nil {
+			accessToken, _ = s.oauthRepo.FindAccessTokenByID(*refreshToken.AccessTokenID)
+		}
+		if accessToken == nil || !accessToken.HasEndUser() {
+			return nil, false
+		}
+		/* H-3 跨 client 保护 */
+		if accessToken.ClientID != clientID {
+			return inactive(), true
+		}
+		user, err := s.userRepo.FindByID(*accessToken.UserID)
+		if err != nil || user.IsSuspended() {
+			return inactive(), true
+		}
+		return map[string]interface{}{
+			"active":     true,
+			"scope":      accessToken.Scope,
+			"client_id":  accessToken.ClientID,
+			"username":   user.Username,
+			"token_type": "refresh_token",
+			"exp":        refreshToken.ExpiresAt.Unix(),
+			"iat":        refreshToken.CreatedAt.Unix(),
+			"sub":        user.ID.String(),
+		}, true
+	}
+
+	switch tokenTypeHint {
+	case "access_token":
+		if result, ok := introspectAccessToken(); ok {
+			return result, nil
+		}
+		if result, ok := introspectRefreshToken(); ok {
+			return result, nil
+		}
+	case "refresh_token":
+		if result, ok := introspectRefreshToken(); ok {
+			return result, nil
+		}
+		if result, ok := introspectAccessToken(); ok {
+			return result, nil
+		}
+	default:
+		if result, ok := introspectAccessToken(); ok {
+			return result, nil
+		}
+		if result, ok := introspectRefreshToken(); ok {
 			return result, nil
 		}
 	}
 
-	// 尝试验证为refresh_token
-	if tokenTypeHint == "" || tokenTypeHint == "refresh_token" {
-		refreshToken, err := s.oauthRepo.FindRefreshToken(token)
-		if err == nil && refreshToken != nil && refreshToken.ExpiresAt.After(time.Now()) && !refreshToken.Revoked {
-			// 获取关联的access token信息
-			var accessToken *model.AccessToken
-			if refreshToken.AccessTokenID != nil {
-				accessToken, _ = s.oauthRepo.FindAccessTokenByID(*refreshToken.AccessTokenID)
-			}
-			if accessToken != nil && accessToken.HasEndUser() {
-				/* H-3 跨 client 保护 */
-				if accessToken.ClientID != clientID {
-					return minimalActive(refreshToken.ExpiresAt.Unix()), nil
-				}
-				user, _ := s.userRepo.FindByID(*accessToken.UserID)
-				return map[string]interface{}{
-					"active":     true,
-					"scope":      accessToken.Scope,
-					"client_id":  accessToken.ClientID,
-					"username":   user.Username,
-					"token_type": "refresh_token",
-					"exp":        refreshToken.ExpiresAt.Unix(),
-					"iat":        refreshToken.CreatedAt.Unix(),
-					"sub":        user.ID.String(),
-				}, nil
-			}
-		}
-	}
-
 	/* 未找到或无效：RFC 7662 §2.2 要求返回 active=false 而非 4xx */
-	return map[string]interface{}{"active": false}, nil
+	return inactive(), nil
 }

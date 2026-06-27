@@ -203,7 +203,7 @@ func main() {
 
 	// 设置路由
 	router.SetBuildInfo(buildID)
-	r, routerCleanup := router.Setup(cfg, cacheInstance)
+	r, ldapSyncService, routerCleanup := router.Setup(cfg, cacheInstance)
 	printInitStep("✓", "Router", "routes registered")
 
 	// Webhook background retry worker
@@ -224,7 +224,22 @@ func main() {
 			}
 		}
 	}()
-	printInitStep("✓", "Webhook", "background retry worker started")
+	// LDAP background sync worker
+	if ldapSyncService != nil {
+		go func() {
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-bgCtx.Done():
+					return
+				case <-ticker.C:
+					ldapSyncService.RunScheduledSync(bgCtx)
+				}
+			}
+		}()
+		printInitStep("✓", "LDAP Sync", "background sync worker started")
+	}
 
 	/*
 	 * 过期数据自动清理任务：每 30 分钟清理一次

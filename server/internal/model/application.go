@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"net/url"
 	"strings"
 	"time"
 
@@ -126,8 +127,22 @@ func (a *Application) SetScopes(scopes []string) {
 }
 
 /*
+ * redirectURIOrigin 提取回调地址的 origin（scheme + host[:port]）
+ */
+func redirectURIOrigin(uri string) (string, bool) {
+	parsed, err := url.Parse(uri)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", false
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host), true
+}
+
+/*
  * ValidateRedirectURI 校验回调地址是否在允许列表中
- * 功能：精确匹配 + 安全校验，阻止开放重定向攻击
+ * 功能：精确匹配 + 同 origin 子路径放行 + 安全校验，阻止开放重定向攻击
+ *       - 精确匹配已登记的 redirect_uri
+ *       - 若已登记同一 origin 的任一 redirect_uri，则允许该 origin 下其他路径
+ *         （便于业务系统 SSO 接入使用独立回调路径，如 /sso/callback）
  *       - 禁止 javascript:/data: 等危险协议
  *       - 禁止路径穿越（/../）
  *       - 禁止带用户信息的 URI（user@host）
@@ -146,8 +161,20 @@ func (a *Application) ValidateRedirectURI(uri string) bool {
 		return false
 	}
 
-	for _, allowed := range a.GetRedirectURIs() {
+	allowedURIs := a.GetRedirectURIs()
+	for _, allowed := range allowedURIs {
 		if allowed == uri {
+			return true
+		}
+	}
+
+	requestedOrigin, ok := redirectURIOrigin(uri)
+	if !ok {
+		return false
+	}
+	for _, allowed := range allowedURIs {
+		allowedOrigin, ok := redirectURIOrigin(allowed)
+		if ok && allowedOrigin == requestedOrigin {
 			return true
 		}
 	}

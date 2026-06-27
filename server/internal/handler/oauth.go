@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -49,6 +50,9 @@ type AuthorizeRequest struct {
 	RedirectURI         string `form:"redirect_uri" binding:"required"`
 	Scope               string `form:"scope"`
 	State               string `form:"state"`
+	Nonce               string `form:"nonce"`
+	MaxAge              string `form:"max_age"`
+	Prompt              string `form:"prompt"`
 	CodeChallenge       string `form:"code_challenge"`
 	CodeChallengeMethod string `form:"code_challenge_method"`
 }
@@ -89,6 +93,39 @@ func (h *OAuthHandler) shouldRedirectAuthorizeToExternalUI(c *gin.Context) bool 
 	return true
 }
 
+func oidcPromptHasNone(prompt string) bool {
+	for _, value := range strings.Fields(prompt) {
+		if value == "none" {
+			return true
+		}
+	}
+	return false
+}
+
+func oidcIssuerFromRequest(c *gin.Context) string {
+	if c == nil || c.Request == nil {
+		return ""
+	}
+	host := requestHost(c.Request)
+	if host == "" {
+		return ""
+	}
+	return requestScheme(c.Request) + "://" + host
+}
+
+func (h *OAuthHandler) oidcPromptErrorResponse(c *gin.Context, redirectURI, state, prompt, errorCode, errorDescription string) bool {
+	if !oidcPromptHasNone(prompt) {
+		return false
+	}
+	redirectURL := h.buildRedirectURL(redirectURI, map[string]string{
+		"error":             errorCode,
+		"error_description": errorDescription,
+		"state":             state,
+	})
+	Success(c, gin.H{"redirect_url": redirectURL})
+	return true
+}
+
 // GetAppInfo returns application info for authorization page
 // GET /api/oauth/app-info
 func (h *OAuthHandler) GetAppInfo(c *gin.Context) {
@@ -107,18 +144,9 @@ func (h *OAuthHandler) GetAppInfo(c *gin.Context) {
 	}
 
 	// Validate redirect URI if provided
-	if redirectURI != "" {
-		validURI := false
-		for _, uri := range app.GetRedirectURIs() {
-			if uri == redirectURI {
-				validURI = true
-				break
-			}
-		}
-		if !validURI {
-			BadRequest(c, "Invalid redirect_uri")
-			return
-		}
+	if redirectURI != "" && !app.ValidateRedirectURI(redirectURI) {
+		BadRequest(c, "Invalid redirect_uri")
+		return
 	}
 
 	requestedScope := c.Query("scope")
@@ -127,15 +155,15 @@ func (h *OAuthHandler) GetAppInfo(c *gin.Context) {
 	issuedTypes := app.GetIssuedTokenTypesForRequest(scopeBreakdown.EffectiveScope, responseType)
 	Success(c, gin.H{
 		"app": gin.H{
-			"id":                       app.ID.String(),
-			"client_id":                app.ClientID,
-			"name":                     app.Name,
-			"description":              app.Description,
-			"scopes":                   app.GetUserAuthorizationScopes(),
-			"allowed_scopes":           app.GetAllowedScopes(),
-			"grant_types":              app.GetGrantTypes(),
-			"response_types_supported": app.GetResponseTypesSupported(),
-			"app_type":                 app.AppType,
+			"id":                         app.ID.String(),
+			"client_id":                  app.ClientID,
+			"name":                       app.Name,
+			"description":                app.Description,
+			"scopes":                     app.GetUserAuthorizationScopes(),
+			"allowed_scopes":             app.GetAllowedScopes(),
+			"grant_types":                app.GetGrantTypes(),
+			"response_types_supported":   app.GetResponseTypesSupported(),
+			"app_type":                   app.AppType,
 			"token_endpoint_auth_method": app.TokenEndpointAuthMethod,
 			"issued_token_types":         issuedTypes,
 		},
@@ -161,15 +189,36 @@ func (h *OAuthHandler) GetAuthorizePending(c *gin.Context) {
 		Unauthorized(c, "User not authenticated")
 		return
 	}
+	authTime, _ := gctx.GetAuthTime(c)
+	authMethods, _ := gctx.GetAuthMethods(c)
 	result, err := h.oauthService.FindPendingAuthorization(&service.AuthorizeInput{
 		ClientID:      clientID,
 		RedirectURI:   redirectURI,
 		Scope:         c.Query("scope"),
 		State:         c.Query("state"),
+		Nonce:         c.Query("nonce"),
+		MaxAge:        c.Query("max_age"),
+		Prompt:        c.Query("prompt"),
+		AuthTime:      authTime,
+		AMR:           authMethods,
 		CodeChallenge: c.Query("code_challenge"),
 		UserID:        userID,
 	})
 	if err != nil {
+		if errors.Is(err, service.ErrLoginRequired) {
+			if h.oidcPromptErrorResponse(c, redirectURI, c.Query("state"), c.Query("prompt"), "login_required", "End-user authentication is required") {
+				return
+			}
+			Success(c, gin.H{"pending": false, "login_required": true})
+			return
+		}
+		if errors.Is(err, service.ErrConsentRequired) {
+			if h.oidcPromptErrorResponse(c, redirectURI, c.Query("state"), c.Query("prompt"), "consent_required", "End-user consent is required") {
+				return
+			}
+			Success(c, gin.H{"pending": false})
+			return
+		}
 		Success(c, gin.H{"pending": false})
 		return
 	}
@@ -191,6 +240,9 @@ type AuthorizeSubmitRequest struct {
 	ResponseType        string `json:"response_type" binding:"required"`
 	Scope               string `json:"scope"`
 	State               string `json:"state"`
+	Nonce               string `json:"nonce"`
+	MaxAge              string `json:"max_age"`
+	Prompt              string `json:"prompt"`
 	CodeChallenge       string `json:"code_challenge"`
 	CodeChallengeMethod string `json:"code_challenge_method"`
 	Consent             string `json:"consent" binding:"required"` // "allow" or "deny"
@@ -217,11 +269,18 @@ func (h *OAuthHandler) AuthorizeSubmit(c *gin.Context) {
 		Unauthorized(c, "User not authenticated")
 		return
 	}
+	authTime, _ := gctx.GetAuthTime(c)
+	authMethods, _ := gctx.GetAuthMethods(c)
 
 	// Get application info
 	app, err := h.oauthService.GetApplication(req.ClientID)
 	if err != nil {
 		NotFound(c, "Application not found")
+		return
+	}
+
+	if !app.ValidateRedirectURI(req.RedirectURI) {
+		BadRequest(c, service.ErrInvalidRedirectURI.Error())
 		return
 	}
 
@@ -246,11 +305,30 @@ func (h *OAuthHandler) AuthorizeSubmit(c *gin.Context) {
 		ResponseType:        req.ResponseType,
 		Scope:               req.Scope,
 		State:               req.State,
+		Nonce:               req.Nonce,
+		MaxAge:              req.MaxAge,
+		Prompt:              req.Prompt,
+		AuthTime:            authTime,
+		AMR:                 authMethods,
 		CodeChallenge:       req.CodeChallenge,
 		CodeChallengeMethod: req.CodeChallengeMethod,
 		UserID:              userID,
 	})
 	if err != nil {
+		if errors.Is(err, service.ErrLoginRequired) {
+			if h.oidcPromptErrorResponse(c, req.RedirectURI, req.State, req.Prompt, "login_required", "End-user authentication is required") {
+				return
+			}
+			Success(c, gin.H{"login_required": true})
+			return
+		}
+		if errors.Is(err, service.ErrConsentRequired) {
+			if h.oidcPromptErrorResponse(c, req.RedirectURI, req.State, req.Prompt, "consent_required", "End-user consent is required") {
+				return
+			}
+			BadRequest(c, err.Error())
+			return
+		}
 		/* 区分客户端错误和服务端错误，PKCE/scope/redirect 等返回 400 */
 		switch {
 		case errors.Is(err, service.ErrInvalidClient),
@@ -334,8 +412,14 @@ type TokenRequest struct {
 // Token handles the token endpoint
 // POST /oauth/token
 func (h *OAuthHandler) Token(c *gin.Context) {
+	setNoStoreHeaders := func() {
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
+	}
+
 	var req TokenRequest
 	if err := c.ShouldBind(&req); err != nil {
+		setNoStoreHeaders()
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":             "invalid_request",
 			"error_description": err.Error(),
@@ -344,12 +428,18 @@ func (h *OAuthHandler) Token(c *gin.Context) {
 	}
 
 	// Try to get client credentials from Authorization header
-	if req.ClientID == "" || req.ClientSecret == "" {
-		clientID, clientSecret, ok := c.Request.BasicAuth()
-		if ok {
-			req.ClientID = clientID
-			req.ClientSecret = clientSecret
-		}
+	clientID, clientSecret, hasBasicAuth := c.Request.BasicAuth()
+	if hasBasicAuth && (req.ClientID != "" || req.ClientSecret != "") {
+		setNoStoreHeaders()
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":             "invalid_request",
+			"error_description": "multiple client authentication methods are not allowed",
+		})
+		return
+	}
+	if hasBasicAuth {
+		req.ClientID = clientID
+		req.ClientSecret = clientSecret
 	}
 
 	result, err := h.oauthService.Token(&service.TokenInput{
@@ -359,6 +449,9 @@ func (h *OAuthHandler) Token(c *gin.Context) {
 		ClientID:           req.ClientID,
 		ClientSecret:       req.ClientSecret,
 		RefreshToken:       req.RefreshToken,
+		Issuer:             oidcIssuerFromRequest(c),
+		IPAddress:          c.ClientIP(),
+		UserAgent:          c.Request.UserAgent(),
 		CodeVerifier:       req.CodeVerifier,
 		Scope:              req.Scope,
 		DeviceCode:         req.DeviceCode,
@@ -371,6 +464,10 @@ func (h *OAuthHandler) Token(c *gin.Context) {
 		Resource:           req.Resource,
 	})
 	if err != nil {
+		setNoStoreHeaders()
+		if errors.Is(err, service.ErrInvalidClient) && c.GetHeader("Authorization") != "" {
+			c.Header("WWW-Authenticate", `Basic realm="oauth"`)
+		}
 		h.handleTokenError(c, err)
 		return
 	}
@@ -406,8 +503,7 @@ func (h *OAuthHandler) Token(c *gin.Context) {
 	audit.Log(audit.ActionTokenIssue, audit.ResultSuccess, actorID, req.ClientID, c.ClientIP(), "grant_type", req.GrantType)
 
 	/* RFC 6749 Section 5.1: Token 响应必须包含 Cache-Control 和 Pragma 头 */
-	c.Header("Cache-Control", "no-store")
-	c.Header("Pragma", "no-cache")
+	setNoStoreHeaders()
 	c.JSON(http.StatusOK, result)
 }
 
@@ -415,6 +511,8 @@ func (h *OAuthHandler) Token(c *gin.Context) {
 type RevokeRequest struct {
 	Token         string `form:"token" binding:"required"`
 	TokenTypeHint string `form:"token_type_hint"`
+	ClientID      string `form:"client_id"`
+	ClientSecret  string `form:"client_secret"`
 }
 
 // Revoke handles the token revocation endpoint
@@ -429,14 +527,42 @@ func (h *OAuthHandler) Revoke(c *gin.Context) {
 		return
 	}
 
-	if err := h.oauthService.RevokeToken(req.Token, req.TokenTypeHint); err != nil {
-		audit.Log(audit.ActionTokenRevoke, audit.ResultFailure, "client", "unknown", c.ClientIP(), "hint", req.TokenTypeHint)
-		// Per RFC 7009, we should return 200 even if token is invalid
+	formCredentials := req.ClientID != "" || req.ClientSecret != ""
+	authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
+	hasBasicAuth := strings.HasPrefix(strings.ToLower(authHeader), "basic ")
+	if formCredentials && hasBasicAuth {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+
+	usedBasicAuth := false
+	if hasBasicAuth {
+		clientID, clientSecret, ok := c.Request.BasicAuth()
+		if !ok || clientID == "" {
+			c.Header("WWW-Authenticate", "Basic")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})
+			return
+		}
+		req.ClientID = clientID
+		req.ClientSecret = clientSecret
+		usedBasicAuth = true
+	}
+
+	if err := h.oauthService.RevokeTokenForClient(req.Token, req.TokenTypeHint, req.ClientID, req.ClientSecret); err != nil {
+		audit.Log(audit.ActionTokenRevoke, audit.ResultFailure, "client", req.ClientID, c.ClientIP(), "hint", req.TokenTypeHint)
+		if errors.Is(err, service.ErrInvalidClient) {
+			if usedBasicAuth {
+				c.Header("WWW-Authenticate", "Basic")
+			}
+			h.handleTokenError(c, err)
+			return
+		}
+		// Per RFC 7009, return 200 for invalid or unknown token values.
 		c.JSON(http.StatusOK, gin.H{})
 		return
 	}
 
-	audit.Log(audit.ActionTokenRevoke, audit.ResultSuccess, "client", "token_holder", c.ClientIP(), "hint", req.TokenTypeHint)
+	audit.Log(audit.ActionTokenRevoke, audit.ResultSuccess, "client", req.ClientID, c.ClientIP(), "hint", req.TokenTypeHint)
 	c.JSON(http.StatusOK, gin.H{})
 }
 
@@ -451,36 +577,45 @@ func (h *OAuthHandler) Revoke(c *gin.Context) {
  * GET /oauth/userinfo
  */
 func (h *OAuthHandler) UserInfo(c *gin.Context) {
+	writeBearerError := func(status int, errCode, description string) {
+		challenge := fmt.Sprintf(`Bearer error="%s", error_description="%s"`, errCode, description)
+		if errCode == "insufficient_scope" {
+			challenge += `, scope="openid"`
+		}
+		c.Header("WWW-Authenticate", challenge)
+		c.JSON(status, gin.H{
+			"error":             errCode,
+			"error_description": description,
+		})
+	}
+
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error":             "invalid_token",
-			"error_description": "Missing access token",
-		})
+		writeBearerError(http.StatusUnauthorized, "invalid_token", "Missing access token")
+		return
+	}
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		writeBearerError(http.StatusUnauthorized, "invalid_token", "Authorization header must use Bearer scheme")
 		return
 	}
 
-	token := strings.TrimPrefix(authHeader, "Bearer ")
+	token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	if token == "" {
+		writeBearerError(http.StatusUnauthorized, "invalid_token", "Missing access token")
+		return
+	}
+
 	user, scope, err := h.oauthService.GetUserInfoWithScope(token)
 	if err != nil {
-		if errors.Is(err, service.ErrNoUserInToken) {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error":             "insufficient_scope",
-				"error_description": "This access token does not represent an end-user (e.g. client_credentials)",
-			})
+		if errors.Is(err, service.ErrNoUserInToken) || errors.Is(err, service.ErrInvalidScope) {
+			writeBearerError(http.StatusForbidden, "insufficient_scope", "This access token is not authorized for the UserInfo endpoint")
 			return
 		}
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error":             "invalid_token",
-			"error_description": "Invalid or expired token",
-		})
+		writeBearerError(http.StatusUnauthorized, "invalid_token", "Invalid or expired token")
 		return
 	}
 	if user == nil {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error":             "insufficient_scope",
-			"error_description": "This access token does not represent an end-user",
-		})
+		writeBearerError(http.StatusForbidden, "insufficient_scope", "This access token does not represent an end-user")
 		return
 	}
 
@@ -496,7 +631,7 @@ func (h *OAuthHandler) UserInfo(c *gin.Context) {
 	}
 
 	/* profile scope: 基本个人资料（始终返回所有标准声明，空值也返回） */
-	hasProfile := scopeSet["profile"] || scopeSet["openid"]
+	hasProfile := scopeSet["profile"]
 	if hasProfile {
 		response["name"] = user.GetFullName()
 		response["preferred_username"] = user.Username
@@ -533,19 +668,19 @@ func (h *OAuthHandler) UserInfo(c *gin.Context) {
 	}
 
 	/* email scope */
-	if scopeSet["email"] || scopeSet["openid"] {
+	if scopeSet["email"] {
 		response["email"] = user.Email
 		response["email_verified"] = user.EmailVerified
 	}
 
-	/* phone scope（与 profile 一致：openid 时也返回声明，空值也返回） */
-	if scopeSet["phone"] || scopeSet["openid"] {
+	/* phone scope */
+	if scopeSet["phone"] {
 		response["phone_number"] = user.PhoneNumber
 		response["phone_number_verified"] = user.PhoneVerified
 	}
 
-	/* address scope（openid 时也返回空地址对象，便于 OIDC 自检） */
-	if scopeSet["address"] || scopeSet["openid"] {
+	/* address scope */
+	if scopeSet["address"] {
 		response["address"] = user.GetAddress()
 	}
 
@@ -633,6 +768,18 @@ func (h *OAuthHandler) handleTokenError(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrInvalidGrant):
 		errorCode = "invalid_grant"
 		status = http.StatusBadRequest
+	case errors.Is(err, service.ErrInvalidRedirectURI):
+		errorCode = "invalid_grant"
+		status = http.StatusBadRequest
+	case errors.Is(err, service.ErrUnsupportedGrantType):
+		errorCode = "unsupported_grant_type"
+		status = http.StatusBadRequest
+	case errors.Is(err, service.ErrInvalidRequest):
+		errorCode = "invalid_request"
+		status = http.StatusBadRequest
+	case errors.Is(err, service.ErrInvalidTarget):
+		errorCode = "invalid_target"
+		status = http.StatusBadRequest
 	case errors.Is(err, service.ErrAuthCodeExpired):
 		errorCode = "invalid_grant"
 		status = http.StatusBadRequest
@@ -680,6 +827,10 @@ func (h *OAuthHandler) handleTokenError(c *gin.Context, err error) {
 // Introspect handles token introspection (RFC 7662)
 // POST /oauth/introspect
 func (h *OAuthHandler) Introspect(c *gin.Context) {
+	/* RFC 7662: Introspect 响应禁止缓存 */
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
+
 	// 获取token
 	token := c.PostForm("token")
 	if token == "" {
@@ -687,13 +838,29 @@ func (h *OAuthHandler) Introspect(c *gin.Context) {
 		return
 	}
 
-	// 验证客户端凭据（可选但推荐）
+	// 验证客户端凭据
 	clientID := c.PostForm("client_id")
 	clientSecret := c.PostForm("client_secret")
+	formCredentials := clientID != "" || clientSecret != ""
+	authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
+	hasBasicAuth := strings.HasPrefix(strings.ToLower(authHeader), "basic ")
 
-	// 如果没有通过表单传递，尝试Basic Auth
-	if clientID == "" {
-		clientID, clientSecret, _ = c.Request.BasicAuth()
+	if formCredentials && hasBasicAuth {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+
+	usedBasicAuth := false
+	if hasBasicAuth {
+		basicClientID, basicClientSecret, ok := c.Request.BasicAuth()
+		if !ok || basicClientID == "" {
+			c.Header("WWW-Authenticate", "Basic")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})
+			return
+		}
+		clientID = basicClientID
+		clientSecret = basicClientSecret
+		usedBasicAuth = true
 	}
 
 	// 获取token类型提示
@@ -702,17 +869,24 @@ func (h *OAuthHandler) Introspect(c *gin.Context) {
 	// 调用服务验证token
 	tokenInfo, err := h.oauthService.IntrospectToken(token, clientID, clientSecret, tokenTypeHint)
 
-	/* RFC 7662: Introspect 响应禁止缓存 */
-	c.Header("Cache-Control", "no-store")
-	c.Header("Pragma", "no-cache")
-
 	if err != nil {
 		audit.Log(audit.ActionTokenRevoke, audit.ResultFailure, clientID, "introspect", c.ClientIP(), "hint", tokenTypeHint, "active", "false")
+		if errors.Is(err, service.ErrInvalidClient) {
+			if usedBasicAuth {
+				c.Header("WWW-Authenticate", "Basic")
+			}
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_client"})
+			return
+		}
 		// 根据RFC 7662，无效token返回 active: false，不是错误
 		c.JSON(http.StatusOK, gin.H{"active": false})
 		return
 	}
 
-	audit.Log(audit.ActionTokenIssue, audit.ResultSuccess, clientID, "introspect", c.ClientIP(), "hint", tokenTypeHint, "active", "true")
+	active := "false"
+	if isActive, ok := tokenInfo["active"].(bool); ok && isActive {
+		active = "true"
+	}
+	audit.Log(audit.ActionTokenIssue, audit.ResultSuccess, clientID, "introspect", c.ClientIP(), "hint", tokenTypeHint, "active", active)
 	c.JSON(http.StatusOK, tokenInfo)
 }

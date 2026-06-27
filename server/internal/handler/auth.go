@@ -75,6 +75,19 @@ type UserResponse struct {
 	CreatedAt     string `json:"created_at"`
 }
 
+func authTokenData(tokens *service.AuthTokens) gin.H {
+	if tokens == nil {
+		return gin.H{}
+	}
+	return gin.H{
+		"access_token":  tokens.AccessToken,
+		"refresh_token": tokens.RefreshToken,
+		"id_token":      tokens.IDToken,
+		"token_type":    tokens.TokenType,
+		"expires_in":    tokens.ExpiresIn,
+	}
+}
+
 /*
  * Register 用户注册
  * @route POST /api/auth/register
@@ -185,6 +198,10 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			Error(c, http.StatusTooManyRequests, "ACCOUNT_LOCKED", "Account temporarily locked due to too many failed attempts. Please try again later.")
 			return
 		}
+		if errors.Is(err, service.ErrSuspiciousLogin) {
+			Error(c, http.StatusForbidden, ErrCodeSuspiciousLogin, "Login blocked due to suspicious activity")
+			return
+		}
 		Error(c, http.StatusInternalServerError, ErrCodeInternalError, "Failed to login")
 		return
 	}
@@ -212,18 +229,19 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	/* 设置 httpOnly Cookie 和 CSRF Token */
 	h.setAuthCookies(c, tokens)
 
-	Success(c, gin.H{
-		"user": UserResponse{
-			ID:            user.ID.String(),
-			Email:         user.Email,
-			Username:      user.Username,
-			Role:          string(user.Role),
-			Avatar:        user.Avatar,
-			EmailVerified: user.EmailVerified,
-			CreatedAt:     user.CreatedAt.Format("2006-01-02T15:04:05Z"),
-		},
-		"tokens": tokens,
-	})
+	response := authTokenData(tokens)
+	response["user"] = UserResponse{
+		ID:            user.ID.String(),
+		Email:         user.Email,
+		Username:      user.Username,
+		Role:          string(user.Role),
+		Avatar:        user.Avatar,
+		EmailVerified: user.EmailVerified,
+		CreatedAt:     user.CreatedAt.Format("2006-01-02T15:04:05Z"),
+	}
+	response["tokens"] = tokens
+
+	Success(c, response)
 }
 
 /*
@@ -243,7 +261,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		}
 	}
 
-	tokens, err := h.authService.RefreshTokens(req.RefreshToken)
+	tokens, err := h.authService.RefreshTokensWithRequestContext(req.RefreshToken, c.ClientIP(), c.Request.UserAgent())
 	if err != nil {
 		Error(c, http.StatusUnauthorized, ErrCodeTokenExpired, "Invalid or expired refresh token")
 		return
@@ -317,7 +335,7 @@ func setCookie(c *gin.Context, name, value string, maxAge int, path string, secu
  * Secure 标志根据实际请求协议决定（支持反向代理），而非仅看 server.mode，
  * 避免 HTTP 环境下设置 Secure Cookie 导致浏览器不发送
  */
-func (h *AuthHandler) setAuthCookies(c *gin.Context, tokens *service.AuthTokens) {
+func setAuthTokenCookies(c *gin.Context, tokens *service.AuthTokens, refreshMaxAge int) {
 	secure := isRequestSecure(c)
 	sameSite := http.SameSiteLaxMode
 
@@ -328,22 +346,18 @@ func (h *AuthHandler) setAuthCookies(c *gin.Context, tokens *service.AuthTokens)
 		int(tokens.ExpiresIn),
 		"/",
 		secure,
-		true, /* httpOnly */
+		true,
 		sameSite,
 	)
 
 	/* refresh_token - httpOnly Cookie，限制路径 */
-	refreshMaxAge := 30 * 24 * 3600 /* 30 天 */
-	if h.cfg != nil {
-		refreshMaxAge = h.cfg.JWT.RefreshTokenTTLDays * 24 * 3600
-	}
 	setCookie(c,
 		middleware.RefreshTokenCookie,
 		tokens.RefreshToken,
 		refreshMaxAge,
 		"/api/auth",
 		secure,
-		true, /* httpOnly */
+		true,
 		sameSite,
 	)
 
@@ -355,9 +369,17 @@ func (h *AuthHandler) setAuthCookies(c *gin.Context, tokens *service.AuthTokens)
 		int(tokens.ExpiresIn),
 		"/",
 		secure,
-		false, /* 非 httpOnly */
+		false,
 		sameSite,
 	)
+}
+
+func (h *AuthHandler) setAuthCookies(c *gin.Context, tokens *service.AuthTokens) {
+	refreshMaxAge := 30 * 24 * 3600 /* 30 天 */
+	if h.cfg != nil {
+		refreshMaxAge = h.cfg.JWT.RefreshTokenTTLDays * 24 * 3600
+	}
+	setAuthTokenCookies(c, tokens, refreshMaxAge)
 }
 
 /*

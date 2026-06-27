@@ -3,10 +3,8 @@ package handler
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"encoding/base64"
-	"math/big"
 	"net/http"
-	"strings"
+	"net/url"
 	"sync"
 	"time"
 
@@ -29,6 +27,7 @@ type OIDCHandler struct {
 	keyID      string
 	mu         sync.RWMutex
 	oauthRepo  *repository.OAuthRepository
+	appRepo    *repository.ApplicationRepository
 	jwtManager *jwt.Manager
 	cache      cache.Cache
 }
@@ -51,6 +50,11 @@ func NewOIDCHandler(issuer string) *OIDCHandler {
 func (h *OIDCHandler) SetOAuthRepo(oauthRepo *repository.OAuthRepository, jwtManager *jwt.Manager) {
 	h.oauthRepo = oauthRepo
 	h.jwtManager = jwtManager
+}
+
+/* SetApplicationRepo 注入应用仓储（用于校验 OIDC logout 回跳地址） */
+func (h *OIDCHandler) SetApplicationRepo(appRepo *repository.ApplicationRepository) {
+	h.appRepo = appRepo
 }
 
 /* SetCache 注入统一缓存实例（用于 discovery/JWKS 热读缓存） */
@@ -86,11 +90,7 @@ func (h *OIDCHandler) ensureKey() {
 // GET /.well-known/openid-configuration
 func (h *OIDCHandler) Discovery(c *gin.Context) {
 	// 动态获取issuer（基于请求的host）
-	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-		scheme = "https"
-	}
-	issuer := scheme + "://" + c.Request.Host
+	issuer := requestScheme(c.Request) + "://" + requestHost(c.Request)
 	cacheKey := "oidc:discovery:" + issuer
 
 	if h.cache != nil {
@@ -107,27 +107,25 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 		"token_endpoint":         issuer + "/oauth/token",
 		"userinfo_endpoint":      issuer + "/oauth/userinfo",
 		"jwks_uri":               issuer + "/.well-known/jwks.json",
-		"registration_endpoint":  issuer + "/api/apps", // 动态客户端注册
 		"revocation_endpoint":    issuer + "/oauth/revoke",
 		"introspection_endpoint": issuer + "/oauth/introspect",
 		"end_session_endpoint":   issuer + "/oauth/logout",
 
-		// 支持的响应类型
+		// 支持的响应类型：授权提交路径当前只接受 authorization code flow
 		"response_types_supported": []string{
 			"code",
-			"token",
-			"id_token",
-			"code token",
-			"code id_token",
-			"token id_token",
-			"code token id_token",
 		},
 
-		// 支持的响应模式
+		// 支持的响应模式：redirect URL 构造只使用 query 参数
 		"response_modes_supported": []string{
 			"query",
-			"fragment",
-			"form_post",
+		},
+
+		// 支持的 OIDC prompt 值
+		"prompt_values_supported": []string{
+			"none",
+			"login",
+			"consent",
 		},
 
 		// 支持的授权类型
@@ -135,7 +133,6 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 			"authorization_code",
 			"refresh_token",
 			"client_credentials",
-			"implicit",
 			"urn:ietf:params:oauth:grant-type:device_code",
 			"urn:ietf:params:oauth:grant-type:token-exchange",
 		},
@@ -145,9 +142,8 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 			"public",
 		},
 
-		// 支持的ID Token签名算法
+		// 支持的ID Token签名算法：jwt.Manager 当前使用 HS256 签发 id_token
 		"id_token_signing_alg_values_supported": []string{
-			"RS256",
 			"HS256",
 		},
 
@@ -161,27 +157,23 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 		// 支持的 scope（OIDC 用户 scope + 机器 scope）
 		"scopes_supported": model.AllServerSupportedScopes(),
 
-		// 支持的claims
+		// 支持的 claims：仅公布当前 ID Token / UserInfo 实际可输出的标准 claim
 		"claims_supported": []string{
-			// OpenID标准claims
 			"sub",
 			"iss",
 			"aud",
 			"exp",
 			"iat",
-			"auth_time",
 			"nonce",
-			"acr",
+			"auth_time",
 			"amr",
+			"at_hash",
 			"azp",
-			// Profile claims
 			"name",
 			"family_name",
 			"given_name",
-			"middle_name",
 			"nickname",
 			"preferred_username",
-			"profile",
 			"picture",
 			"website",
 			"gender",
@@ -189,13 +181,10 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 			"zoneinfo",
 			"locale",
 			"updated_at",
-			// Email claims
 			"email",
 			"email_verified",
-			// Phone claims
 			"phone_number",
 			"phone_number_verified",
-			// Address claims
 			"address",
 		},
 
@@ -205,8 +194,8 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 		},
 
 		// 其他功能
-		"claims_parameter_supported":       true,
-		"request_parameter_supported":      true,
+		"claims_parameter_supported":       false,
+		"request_parameter_supported":      false,
 		"request_uri_parameter_supported":  false,
 		"require_request_uri_registration": false,
 		"ui_locales_supported":             []string{"zh-CN", "en"},
@@ -229,13 +218,7 @@ func (h *OIDCHandler) Discovery(c *gin.Context) {
 // JWKS returns the JSON Web Key Set
 // GET /.well-known/jwks.json
 func (h *OIDCHandler) JWKS(c *gin.Context) {
-	h.ensureKey()
-
-	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-		scheme = "https"
-	}
-	issuer := scheme + "://" + c.Request.Host
+	issuer := requestScheme(c.Request) + "://" + requestHost(c.Request)
 	cacheKey := "oidc:jwks:" + issuer
 	if h.cache != nil {
 		if cached, err := cache.GetJSON[map[string]interface{}](c.Request.Context(), h.cache, cacheKey); err == nil {
@@ -244,28 +227,8 @@ func (h *OIDCHandler) JWKS(c *gin.Context) {
 		}
 	}
 
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	if h.privateKey == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "No signing key available"})
-		return
-	}
-
-	// 导出公钥
-	publicKey := &h.privateKey.PublicKey
-
 	jwks := map[string]interface{}{
-		"keys": []map[string]interface{}{
-			{
-				"kty": "RSA",
-				"use": "sig",
-				"alg": "RS256",
-				"kid": h.keyID,
-				"n":   base64.RawURLEncoding.EncodeToString(publicKey.N.Bytes()),
-				"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(publicKey.E)).Bytes()),
-			},
-		},
+		"keys": []map[string]interface{}{},
 	}
 
 	if h.cache != nil {
@@ -285,11 +248,7 @@ func (h *OIDCHandler) WebFinger(c *gin.Context) {
 		return
 	}
 
-	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-		scheme = "https"
-	}
-	issuer := scheme + "://" + c.Request.Host
+	issuer := requestScheme(c.Request) + "://" + requestHost(c.Request)
 
 	// 如果请求的是OIDC issuer发现
 	if rel == "http://openid.net/specs/connect/1.0/issuer" || rel == "" {
@@ -328,24 +287,47 @@ func (h *OIDCHandler) Logout(c *gin.Context) {
 	if state == "" {
 		state = c.PostForm("state")
 	}
-	if idTokenHint != "" && h.jwtManager != nil && h.oauthRepo != nil {
+
+	var logoutApp *model.Application
+	issuer := requestScheme(c.Request) + "://" + requestHost(c.Request)
+	if idTokenHint != "" && h.jwtManager != nil {
 		claims, err := h.jwtManager.ValidateToken(idTokenHint)
-		if err == nil && claims != nil {
+		if err != nil && h.appRepo != nil {
+			if unverifiedClaims, parseErr := h.jwtManager.ParseUnverifiedClaims(idTokenHint); parseErr == nil && unverifiedClaims.ClientID != "" {
+				if app, findErr := h.appRepo.FindByClientID(unverifiedClaims.ClientID); findErr == nil {
+					verifiedClaims, verifyErr := h.jwtManager.ValidateClientIDTokenWithIssuer(idTokenHint, app.ClientID, app.ClientSecret, issuer)
+					if verifyErr != nil {
+						verifiedClaims, verifyErr = h.jwtManager.ValidateClientIDToken(idTokenHint, app.ClientID, app.ClientSecret)
+					}
+					if verifyErr == nil {
+						claims = verifiedClaims
+						err = nil
+					}
+				}
+			}
+		}
+		if err == nil && claims != nil && claims.TokenType == jwt.TokenTypeIDToken {
 			userID := claims.UserID
-			if userID != (uuid.UUID{}) {
+			if h.oauthRepo != nil && userID != (uuid.UUID{}) {
 				h.oauthRepo.RevokeTokensByUserID(userID)
+			}
+			if h.appRepo != nil && claims.ClientID != "" {
+				if app, findErr := h.appRepo.FindByClientID(claims.ClientID); findErr == nil {
+					logoutApp = app
+				}
 			}
 		}
 	}
 
-	// 如果有重定向URI，重定向回去
-	if postLogoutRedirectURI != "" {
+	// 如果有已登记重定向 URI，重定向回去
+	if postLogoutRedirectURI != "" && logoutApp != nil && logoutApp.ValidateRedirectURI(postLogoutRedirectURI) {
 		redirectURL := postLogoutRedirectURI
 		if state != "" {
-			if strings.Contains(redirectURL, "?") {
-				redirectURL += "&state=" + state
-			} else {
-				redirectURL += "?state=" + state
+			if u, err := url.Parse(redirectURL); err == nil {
+				q := u.Query()
+				q.Set("state", state)
+				u.RawQuery = q.Encode()
+				redirectURL = u.String()
 			}
 		}
 		c.Redirect(http.StatusFound, redirectURL)

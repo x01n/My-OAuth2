@@ -14,8 +14,10 @@ import (
 	"strings"
 	"time"
 
+	"server/internal/config"
 	"server/internal/model"
 	"server/internal/repository"
+	"server/internal/service"
 	"server/pkg/audit"
 	"server/pkg/jwt"
 
@@ -51,6 +53,7 @@ type FederationHandler struct {
 	jwtManager   *jwt.Manager
 	baseURL      string
 	httpClient   *http.Client
+	cfg          *config.Config
 }
 
 /* SetOAuthRepo 注入 OAuthRepository（启用 Refresh Token Rotation） */
@@ -58,19 +61,54 @@ func (h *FederationHandler) SetOAuthRepo(repo *repository.OAuthRepository) {
 	h.oauthRepo = repo
 }
 
+func (h *FederationHandler) isStoredAccessTokenUsable(token string, userID uuid.UUID) bool {
+	if h.oauthRepo == nil {
+		return true
+	}
+	accessToken, err := h.oauthRepo.FindAccessToken(token)
+	if err != nil {
+		return false
+	}
+	if !accessToken.IsValid() {
+		return false
+	}
+	if !accessToken.HasEndUser() || accessToken.UserID == nil {
+		return false
+	}
+	return *accessToken.UserID == userID
+}
+
+func (h *FederationHandler) storeFederationAccessToken(token string, userID uuid.UUID, ttl time.Duration) error {
+	if h.oauthRepo == nil {
+		return nil
+	}
+	return h.oauthRepo.CreateAccessToken(&model.AccessToken{
+		Token:     token,
+		ClientID:  "",
+		UserID:    &userID,
+		Scope:     federationLoginScope,
+		ExpiresAt: time.Now().Add(ttl),
+	})
+}
+
 func NewFederationHandler(
 	providerRepo *repository.FederationRepository,
 	userRepo *repository.UserRepository,
 	jwtManager *jwt.Manager,
 	baseURL string,
+	cfg ...*config.Config,
 ) *FederationHandler {
-	return &FederationHandler{
+	h := &FederationHandler{
 		providerRepo: providerRepo,
 		userRepo:     userRepo,
 		jwtManager:   jwtManager,
 		baseURL:      baseURL,
 		httpClient:   federationHTTPClient,
 	}
+	if len(cfg) > 0 {
+		h.cfg = cfg[0]
+	}
+	return h
 }
 
 // ListProviders returns all enabled federated providers (public)
@@ -109,7 +147,7 @@ func (h *FederationHandler) ListProviders(c *gin.Context) {
 // GET /api/federation/login/:slug
 func (h *FederationHandler) InitiateLogin(c *gin.Context) {
 	slug := c.Param("slug")
-	returnTo := c.Query("return_to")
+	returnTo := safeReturnPath(c.Query("return_to"))
 
 	provider, err := h.providerRepo.FindBySlug(slug)
 	if err != nil || !provider.Enabled {
@@ -190,66 +228,98 @@ func (h *FederationHandler) Callback(c *gin.Context) {
 		return
 	}
 
-	// 生成本地JWT
-	accessToken, err := h.jwtManager.GenerateToken(user.ID, user.Email, user.Username, string(user.Role), jwt.TokenTypeAccess, time.Hour)
+	tokens, err := h.issueFederationLocalTokens(user)
 	if err != nil {
-		h.redirectWithError(c, "Failed to generate token")
+		h.redirectWithError(c, "Failed to generate login session")
 		return
 	}
-	refreshToken, err := h.jwtManager.GenerateToken(user.ID, user.Email, user.Username, string(user.Role), jwt.TokenTypeRefresh, 30*24*time.Hour)
-	if err != nil {
-		h.redirectWithError(c, "Failed to generate refresh token")
+	if err := h.persistFederationLocalTokens(tokens, user.ID); err != nil {
+		h.redirectWithError(c, "Failed to persist login session")
 		return
-	}
-
-	/* 将 refresh token 的 JTI 存入 DB，用于 Token Rotation 追踪 */
-	if h.oauthRepo != nil {
-		if refreshClaims, parseErr := h.jwtManager.ValidateRefreshToken(refreshToken); parseErr == nil {
-			if storeErr := h.oauthRepo.StoreAuthRefreshToken(
-				refreshClaims.ID,
-				user.ID,
-				refreshClaims.ExpiresAt.Time,
-			); storeErr != nil {
-				h.redirectWithError(c, "Failed to persist login session")
-				return
-			}
-		}
 	}
 
 	// 获取return_to
 	returnTo, _ := c.Cookie("fed_return")
-	if returnTo == "" {
-		returnTo = "/dashboard"
-	}
+	returnTo = safeReturnPath(returnTo)
 
 	// 清除cookies
 	fedSecure := isRequestSecure(c)
 	setCookie(c, "fed_state", "", -1, "/", fedSecure, true, http.SameSiteLaxMode)
 	setCookie(c, "fed_return", "", -1, "/", fedSecure, true, http.SameSiteLaxMode)
 
-	/*
-	 * 返回 HTML 页面，通过 localStorage 传递 token
-	 * 安全：使用 JSON 编码防止 XSS 注入（token 和 returnTo 可能包含恶意字符）
-	 */
-	safeAccessToken, _ := json.Marshal(accessToken)
-	safeRefreshToken, _ := json.Marshal(refreshToken)
-	safeReturnTo, _ := json.Marshal(returnTo)
+	setAuthTokenCookies(c, tokens, int(h.federationRefreshTokenTTL().Seconds()))
 
-	html := fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head><title>登录成功</title></head>
-<body>
-<script>
-localStorage.setItem('access_token', %s);
-localStorage.setItem('refresh_token', %s);
-window.location.href = %s;
-</script>
-<p>登录成功，正在跳转...</p>
-</body>
-</html>`, safeAccessToken, safeRefreshToken, safeReturnTo)
+	c.Redirect(http.StatusFound, returnTo)
+}
 
-	c.Header("Content-Type", "text/html")
-	c.String(http.StatusOK, html)
+const federationLoginScope = "openid profile email"
+
+func (h *FederationHandler) federationAccessTokenTTL() time.Duration {
+	if h.cfg != nil && h.cfg.JWT.AccessTokenTTL > 0 {
+		return h.cfg.JWT.AccessTokenTTL
+	}
+	return time.Hour
+}
+
+func (h *FederationHandler) federationRefreshTokenTTL() time.Duration {
+	if h.cfg != nil && h.cfg.JWT.RefreshTokenTTL > 0 {
+		return h.cfg.JWT.RefreshTokenTTL
+	}
+	return 30 * 24 * time.Hour
+}
+
+func (h *FederationHandler) federationIDTokenTTL() time.Duration {
+	if h.cfg != nil && h.cfg.OAuth.IDTokenTTL > 0 {
+		return h.cfg.OAuth.IDTokenTTL
+	}
+	return h.federationAccessTokenTTL()
+}
+
+func (h *FederationHandler) issueFederationLocalTokens(user *model.User) (*service.AuthTokens, error) {
+	authTime := time.Now().Unix()
+	accessTTL := h.federationAccessTokenTTL()
+	refreshTTL := h.federationRefreshTokenTTL()
+
+	accessToken, err := h.jwtManager.GenerateTokenWithAuthTime(
+		user.ID, user.Email, user.Username, string(user.Role), jwt.TokenTypeAccess, authTime, accessTTL,
+	)
+	if err != nil {
+		return nil, err
+	}
+	refreshToken, err := h.jwtManager.GenerateTokenWithAuthTime(
+		user.ID, user.Email, user.Username, string(user.Role), jwt.TokenTypeRefresh, authTime, refreshTTL,
+	)
+	if err != nil {
+		return nil, err
+	}
+	idToken, err := h.jwtManager.GenerateIDTokenWithNonceAndAuthTime(
+		user.ID, user.Email, user.Username, string(user.Role), "", federationLoginScope, "", authTime, h.federationIDTokenTTL(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &service.AuthTokens{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		IDToken:      idToken,
+		TokenType:    "Bearer",
+		ExpiresIn:    int64(accessTTL.Seconds()),
+	}, nil
+}
+
+func (h *FederationHandler) persistFederationLocalTokens(tokens *service.AuthTokens, userID uuid.UUID) error {
+	if h.oauthRepo == nil {
+		return nil
+	}
+	if err := h.storeFederationAccessToken(tokens.AccessToken, userID, h.federationAccessTokenTTL()); err != nil {
+		return err
+	}
+	refreshClaims, err := h.jwtManager.ValidateRefreshToken(tokens.RefreshToken)
+	if err != nil {
+		return err
+	}
+	return h.oauthRepo.StoreAuthRefreshToken(refreshClaims.ID, userID, refreshClaims.ExpiresAt.Time)
 }
 
 // VerifyToken verifies a token from a trusted app (for multi-system SSO)
@@ -282,9 +352,14 @@ func (h *FederationHandler) VerifyToken(c *gin.Context) {
 		return
 	}
 
-	// 验证JWT
-	claims, err := h.jwtManager.ValidateToken(req.Token)
+	// 验证 access token，禁止 refresh token 被当作 access token 使用
+	claims, err := h.jwtManager.ValidateAccessToken(req.Token)
 	if err != nil {
+		Unauthorized(c, "Invalid or expired token")
+		return
+	}
+
+	if !h.isStoredAccessTokenUsable(req.Token, claims.UserID) {
 		Unauthorized(c, "Invalid or expired token")
 		return
 	}
@@ -293,6 +368,13 @@ func (h *FederationHandler) VerifyToken(c *gin.Context) {
 	user, err := h.userRepo.FindByID(claims.UserID)
 	if err != nil {
 		Unauthorized(c, "User not found")
+		return
+	}
+	if user.IsSuspended() {
+		if h.oauthRepo != nil {
+			_ = h.oauthRepo.RevokeTokensByUserID(user.ID)
+		}
+		Unauthorized(c, "User account is disabled")
 		return
 	}
 
@@ -369,6 +451,24 @@ func (h *FederationHandler) AdminCreateProvider(c *gin.Context) {
 	Success(c, req)
 }
 
+type federatedProviderUpdateRequest struct {
+	Name               *string `json:"name,omitempty"`
+	Slug               *string `json:"slug,omitempty"`
+	Description        *string `json:"description,omitempty"`
+	AuthURL            *string `json:"auth_url,omitempty"`
+	TokenURL           *string `json:"token_url,omitempty"`
+	UserInfoURL        *string `json:"userinfo_url,omitempty"`
+	ClientID           *string `json:"client_id,omitempty"`
+	ClientSecret       *string `json:"client_secret,omitempty"`
+	Scopes             *string `json:"scopes,omitempty"`
+	Enabled            *bool   `json:"enabled,omitempty"`
+	AutoCreateUser     *bool   `json:"auto_create_user,omitempty"`
+	TrustEmailVerified *bool   `json:"trust_email_verified,omitempty"`
+	SyncProfile        *bool   `json:"sync_profile,omitempty"`
+	IconURL            *string `json:"icon_url,omitempty"`
+	ButtonText         *string `json:"button_text,omitempty"`
+}
+
 // AdminUpdateProvider updates a provider
 // PUT /api/admin/federation/providers/:id
 func (h *FederationHandler) AdminUpdateProvider(c *gin.Context) {
@@ -378,19 +478,86 @@ func (h *FederationHandler) AdminUpdateProvider(c *gin.Context) {
 		return
 	}
 
-	var req model.FederatedProvider
+	provider, err := h.providerRepo.FindByID(id)
+	if err != nil {
+		NotFound(c, "Provider not found")
+		return
+	}
+
+	var req federatedProviderUpdateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		BadRequest(c, err.Error())
 		return
 	}
-	req.ID = id
 
-	if err = h.providerRepo.UpdateProvider(&req); err != nil {
+	if req.Name != nil {
+		provider.Name = strings.TrimSpace(*req.Name)
+	}
+	if req.Slug != nil {
+		provider.Slug = strings.TrimSpace(*req.Slug)
+	}
+	if req.Description != nil {
+		provider.Description = strings.TrimSpace(*req.Description)
+	}
+	if req.AuthURL != nil {
+		provider.AuthURL = strings.TrimSpace(*req.AuthURL)
+	}
+	if req.TokenURL != nil {
+		provider.TokenURL = strings.TrimSpace(*req.TokenURL)
+	}
+	if req.UserInfoURL != nil {
+		provider.UserInfoURL = strings.TrimSpace(*req.UserInfoURL)
+	}
+	if req.ClientID != nil {
+		provider.ClientID = strings.TrimSpace(*req.ClientID)
+	}
+	if req.ClientSecret != nil && strings.TrimSpace(*req.ClientSecret) != "" {
+		provider.ClientSecret = *req.ClientSecret
+	}
+	if req.Scopes != nil {
+		provider.Scopes = strings.TrimSpace(*req.Scopes)
+	}
+	if req.Enabled != nil {
+		provider.Enabled = *req.Enabled
+	}
+	if req.AutoCreateUser != nil {
+		provider.AutoCreateUser = *req.AutoCreateUser
+	}
+	if req.TrustEmailVerified != nil {
+		provider.TrustEmailVerified = *req.TrustEmailVerified
+	}
+	if req.SyncProfile != nil {
+		provider.SyncProfile = *req.SyncProfile
+	}
+	if req.IconURL != nil {
+		provider.IconURL = strings.TrimSpace(*req.IconURL)
+	}
+	if req.ButtonText != nil {
+		provider.ButtonText = strings.TrimSpace(*req.ButtonText)
+	}
+
+	if provider.Name == "" || provider.Slug == "" || provider.ClientID == "" || provider.ClientSecret == "" {
+		BadRequest(c, "Name, slug, client_id and client_secret are required")
+		return
+	}
+
+	for _, u := range []string{provider.AuthURL, provider.TokenURL, provider.UserInfoURL} {
+		if u == "" {
+			BadRequest(c, "auth_url, token_url, and userinfo_url are required")
+			return
+		}
+		if !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "http://") {
+			BadRequest(c, "URLs must start with http:// or https://")
+			return
+		}
+	}
+
+	if err = h.providerRepo.UpdateProvider(provider); err != nil {
 		InternalError(c, "Failed to update provider")
 		return
 	}
 
-	Success(c, req)
+	Success(c, provider)
 }
 
 // AdminDeleteProvider deletes a provider

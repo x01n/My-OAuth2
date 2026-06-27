@@ -16,6 +16,7 @@ const (
 	ErrCodeCSRFInvalid        = "CSRF_INVALID"
 	ErrCodeSessionExpired     = "SESSION_EXPIRED"
 	ErrCodeAdminRequired      = "ADMIN_REQUIRED"
+	ErrCodeSuspiciousLogin    = "SUSPICIOUS_LOGIN"
 )
 
 /* ===== 注册/用户错误 ===== */

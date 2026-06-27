@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -67,6 +68,38 @@ type DatabaseConfig struct {
 	ConnMaxIdleTimeMin int    `json:"conn_max_idle_time_min"` // 空闲连接最大存活时间(分钟)
 }
 
+func RedactConfigDSN(driver, dsn string) string {
+	dsn = strings.TrimSpace(dsn)
+	if dsn == "" {
+		return ""
+	}
+	if driver == "postgres" {
+		if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+			parsed, err := url.Parse(dsn)
+			if err == nil {
+				if parsed.User != nil {
+					username := parsed.User.Username()
+					if username != "" {
+						parsed.User = url.UserPassword(username, "***REDACTED***")
+					} else {
+						parsed.User = url.User("***REDACTED***")
+					}
+				}
+				return parsed.String()
+			}
+		}
+	}
+	if driver == "mysql" {
+		if at := strings.LastIndex(dsn, "@"); at > 0 {
+			creds := dsn[:at]
+			if colon := strings.Index(creds, ":"); colon >= 0 {
+				return creds[:colon+1] + "***REDACTED***" + dsn[at:]
+			}
+		}
+	}
+	return dsn
+}
+
 /* CacheConfig 缓存配置，支持 memory/redis/memcached/badger/file */
 type CacheConfig struct {
 	Driver           string   `json:"driver"`            // memory, redis, memcached, badger, file
@@ -113,6 +146,77 @@ type SocialConfig struct {
 	Enabled bool                 `json:"enabled"`
 	GitHub  SocialProviderConfig `json:"github"`
 	Google  SocialProviderConfig `json:"google"`
+}
+
+type LDAPConfig struct {
+	Providers []LDAPProviderConfig `json:"providers"`
+}
+
+type LDAPProviderConfig struct {
+	Name               string           `json:"name"`
+	Slug               string           `json:"slug"`
+	Description        string           `json:"description,omitempty"`
+	LDAPURL            string           `json:"ldap_url"`
+	UseStartTLS        bool             `json:"use_starttls"`
+	InsecureSkipVerify bool             `json:"insecure_skip_verify"`
+	BindDN             string           `json:"bind_dn,omitempty"`
+	BindPassword       string           `json:"bind_password,omitempty"`
+	BaseDN             string           `json:"base_dn"`
+	UserFilter         string           `json:"user_filter,omitempty"`
+	ExternalIDAttr     string           `json:"external_id_attr,omitempty"`
+	PrincipalAttr      string           `json:"principal_attr,omitempty"`
+	EmailAttr          string           `json:"email_attr,omitempty"`
+	UsernameAttr       string           `json:"username_attr,omitempty"`
+	EmployeeIDAttr     string           `json:"employee_id_attr,omitempty"`
+	DisplayNameAttr    string           `json:"display_name_attr,omitempty"`
+	GivenNameAttr      string           `json:"given_name_attr,omitempty"`
+	FamilyNameAttr     string           `json:"family_name_attr,omitempty"`
+	GroupAttr          string           `json:"group_attr,omitempty"`
+	RoleMappings       map[string]string `json:"role_mappings,omitempty"`
+	DefaultRole        string           `json:"default_role,omitempty"`
+	Enabled            bool             `json:"enabled"`
+	AutoCreateUser     bool             `json:"auto_create_user"`
+	TrustEmailVerified bool             `json:"trust_email_verified"`
+	SyncProfile        bool             `json:"sync_profile"`
+	SyncEnabled        bool             `json:"sync_enabled"`
+	SyncIntervalMin    int              `json:"sync_interval_min"`
+	SyncPageSize       int              `json:"sync_page_size"`
+	IconURL            string           `json:"icon_url,omitempty"`
+	ButtonText         string           `json:"button_text,omitempty"`
+}
+
+type SAMLConfig struct {
+	Providers []SAMLProviderConfig `json:"providers"`
+}
+
+type SAMLProviderConfig struct {
+	Name                 string           `json:"name"`
+	Slug                 string           `json:"slug"`
+	Description          string           `json:"description,omitempty"`
+	MetadataURL          string           `json:"metadata_url,omitempty"`
+	MetadataXML          string           `json:"metadata_xml,omitempty"`
+	SPEntityID           string           `json:"sp_entity_id,omitempty"`
+	CertificatePEM       string           `json:"certificate_pem,omitempty"`
+	PrivateKeyPEM        string           `json:"private_key_pem,omitempty"`
+	SignRequests         bool             `json:"sign_requests"`
+	AllowIDPInitiated    bool             `json:"allow_idp_initiated"`
+	DefaultRedirectPath  string           `json:"default_redirect_path,omitempty"`
+	NameIDFormat         string           `json:"name_id_format,omitempty"`
+	EmailAttribute       string           `json:"email_attribute,omitempty"`
+	UsernameAttribute    string           `json:"username_attribute,omitempty"`
+	EmployeeIDAttribute  string           `json:"employee_id_attribute,omitempty"`
+	DisplayNameAttribute string           `json:"display_name_attribute,omitempty"`
+	GivenNameAttribute   string           `json:"given_name_attribute,omitempty"`
+	FamilyNameAttribute  string           `json:"family_name_attribute,omitempty"`
+	GroupAttribute       string           `json:"group_attribute,omitempty"`
+	RoleMappings         map[string]string `json:"role_mappings,omitempty"`
+	DefaultRole          string           `json:"default_role,omitempty"`
+	Enabled              bool             `json:"enabled"`
+	AutoCreateUser       bool             `json:"auto_create_user"`
+	TrustEmailVerified   bool             `json:"trust_email_verified"`
+	SyncProfile          bool             `json:"sync_profile"`
+	IconURL              string           `json:"icon_url,omitempty"`
+	ButtonText           string           `json:"button_text,omitempty"`
 }
 
 type SocialProviderConfig struct {
@@ -206,11 +310,48 @@ func (cfg *Config) applyEnvOverrides() {
 	if v := os.Getenv("DB_DSN"); v != "" {
 		cfg.Database.DSN = v
 	}
+	if v := os.Getenv("DB_MAX_OPEN_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Database.MaxOpenConns = n
+		}
+	}
+	if v := os.Getenv("DB_MAX_IDLE_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Database.MaxIdleConns = n
+		}
+	}
+	if v := os.Getenv("DB_CONN_MAX_LIFETIME_MIN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Database.ConnMaxLifetimeMin = n
+		}
+	}
+	if v := os.Getenv("DB_CONN_MAX_IDLE_TIME_MIN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Database.ConnMaxIdleTimeMin = n
+		}
+	}
 	if v := os.Getenv("CACHE_DRIVER"); v != "" {
 		cfg.Cache.Driver = v
 	}
 	if v := os.Getenv("REDIS_URL"); v != "" {
 		cfg.Cache.RedisURL = v
+	}
+	if v := os.Getenv("CACHE_PREFIX"); v != "" {
+		cfg.Cache.Prefix = v
+	}
+	if v := os.Getenv("CACHE_DEFAULT_TTL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Cache.DefaultTTLSec = n
+		}
+	}
+	if v := os.Getenv("MEMCACHED_SERVERS"); v != "" {
+		cfg.Cache.MemcachedServers = splitCSVEnv(v)
+	}
+	if v := os.Getenv("BADGER_PATH"); v != "" {
+		cfg.Cache.BadgerPath = v
+	}
+	if v := os.Getenv("CACHE_FILE_DIR"); v != "" {
+		cfg.Cache.FileDir = v
 	}
 	if v := os.Getenv("JWT_SECRET"); v != "" {
 		cfg.JWT.Secret = v
@@ -238,6 +379,94 @@ func (cfg *Config) applyEnvOverrides() {
 	if v := os.Getenv("EMAIL_FROM"); v != "" {
 		cfg.Email.From = v
 	}
+	if v := os.Getenv("EMAIL_FROM_NAME"); v != "" {
+		cfg.Email.FromName = v
+	}
+	if v := os.Getenv("EMAIL_USE_TLS"); v != "" {
+		if b, ok := parseBoolEnv(v); ok {
+			cfg.Email.UseTLS = b
+		}
+	}
+	if v := os.Getenv("SOCIAL_ENABLED"); v != "" {
+		if b, ok := parseBoolEnv(v); ok {
+			cfg.Social.Enabled = b
+		}
+	}
+	if v := os.Getenv("SOCIAL_GITHUB_ENABLED"); v != "" {
+		if b, ok := parseBoolEnv(v); ok {
+			cfg.Social.GitHub.Enabled = b
+		}
+	}
+	if v := os.Getenv("SOCIAL_GITHUB_CLIENT_ID"); v != "" {
+		cfg.Social.GitHub.ClientID = v
+	}
+	if v := os.Getenv("SOCIAL_GITHUB_CLIENT_SECRET"); v != "" {
+		cfg.Social.GitHub.ClientSecret = v
+	}
+	if v := os.Getenv("SOCIAL_GOOGLE_ENABLED"); v != "" {
+		if b, ok := parseBoolEnv(v); ok {
+			cfg.Social.Google.Enabled = b
+		}
+	}
+	if v := os.Getenv("SOCIAL_GOOGLE_CLIENT_ID"); v != "" {
+		cfg.Social.Google.ClientID = v
+	}
+	if v := os.Getenv("SOCIAL_GOOGLE_CLIENT_SECRET"); v != "" {
+		cfg.Social.Google.ClientSecret = v
+	}
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		cfg.Log.Level = v
+	}
+	if v := os.Getenv("LOG_FORMAT"); v != "" {
+		cfg.Log.Format = v
+	}
+	if v := os.Getenv("LOG_FILE_OUTPUT"); v != "" {
+		cfg.Log.FileOutput = v
+	}
+	if v := os.Getenv("LOG_MAX_SIZE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Log.MaxSizeMB = n
+		}
+	}
+	if v := os.Getenv("LOG_MAX_BACKUPS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Log.MaxBackups = n
+		}
+	}
+	if v := os.Getenv("LOG_MAX_AGE_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Log.MaxAgeDays = n
+		}
+	}
+	if v := os.Getenv("LOG_COMPRESS"); v != "" {
+		if b, ok := parseBoolEnv(v); ok {
+			cfg.Log.Compress = b
+		}
+	}
+}
+
+func parseBoolEnv(raw string) (bool, bool) {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func splitCSVEnv(raw string) []string {
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
 }
 
 // GenerateRandomSecret 生成随机密钥

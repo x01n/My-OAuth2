@@ -45,16 +45,7 @@ func (c *Client) Middleware(next http.Handler) http.Handler {
 
 		// Optionally fetch user info
 		if c.config.UserInfoURL != "" {
-			// Create a temporary client with this token
-			tempStore := NewMemoryTokenStore()
-			tempStore.SetToken(token)
-
-			oldStore := c.tokenStore
-			c.tokenStore = tempStore
-
-			userInfo, err := c.GetUserInfo(r.Context())
-			c.tokenStore = oldStore
-
+			userInfo, err := c.getUserInfoWithAccessToken(r.Context(), tokenString)
 			if err != nil {
 				http.Error(w, "Unauthorized: invalid token", http.StatusUnauthorized)
 				return

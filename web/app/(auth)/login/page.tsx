@@ -6,42 +6,57 @@ import Link from 'next/link';
 import { useAuth } from '@/lib/auth-context';
 import { useI18n } from '@/lib/i18n';
 import { api } from '@/lib/api';
+import { safeReturnPath } from '@/lib/redirect';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Loader2, Mail, Lock, Shield, AlertCircle, ArrowRight, Sparkles, Eye, EyeOff } from 'lucide-react';
 import { ProviderIcon } from '@/components/provider-icon';
-import type { FederationProvider, SocialProvider } from '@/lib/types';
+import type { EnterpriseProviderPublic, FederationProvider, SocialProvider } from '@/lib/types';
+
+type LoginTab = 'local' | 'ldap';
+type ExternalLoginProvider = {
+  slug: string;
+  name: string;
+  icon_url?: string;
+  button_text?: string;
+  type: 'federation' | 'social' | 'saml';
+};
 
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { login, isAuthenticated, isLoading: authLoading } = useAuth();
+  const { login, loginWithLDAP, isAuthenticated, isLoading: authLoading } = useAuth();
   const { t } = useI18n();
-  
+
+  const [activeTab, setActiveTab] = useState<LoginTab>('local');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [ldapIdentifier, setLDAPIdentifier] = useState('');
+  const [ldapPassword, setLDAPPassword] = useState('');
+  const [selectedLDAPProvider, setSelectedLDAPProvider] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [showLDAPPassword, setShowLDAPPassword] = useState(false);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [federationProviders, setFederationProviders] = useState<FederationProvider[]>([]);
   const [socialProviders, setSocialProviders] = useState<SocialProvider[]>([]);
+  const [ldapProviders, setLDAPProviders] = useState<EnterpriseProviderPublic[]>([]);
+  const [samlProviders, setSAMLProviders] = useState<EnterpriseProviderPublic[]>([]);
   const [redirectUrl, setRedirectUrl] = useState<string | null>(null);
 
-  const returnTo = searchParams.get('return_to') || '/dashboard';
+  const returnTo = safeReturnPath(searchParams.get('return_to'));
+  const forceLogin = searchParams.get('force_login') === '1';
 
   /* 已登录用户自动跳转，无需重复登录 */
   useEffect(() => {
-    if (!authLoading && isAuthenticated) {
-      if (returnTo.startsWith('http://') || returnTo.startsWith('https://')) {
-        setRedirectUrl(returnTo);
-      } else {
-        router.replace(returnTo);
-      }
+    if (!authLoading && isAuthenticated && !forceLogin) {
+      router.replace(returnTo);
     }
-  }, [authLoading, isAuthenticated, returnTo, router]);
+  }, [authLoading, forceLogin, isAuthenticated, returnTo, router]);
 
   /* 外部跳转统一通过 useEffect 处理，避免直接赋值 window.location.href */
   useEffect(() => {
@@ -50,12 +65,13 @@ function LoginForm() {
     }
   }, [redirectUrl]);
 
-  /* 加载可用的第三方登录提供商 */
+  /* 加载可用的第三方与企业登录提供商 */
   useEffect(() => {
     const loadProviders = async () => {
-      const [fedRes, socialRes] = await Promise.all([
+      const [fedRes, socialRes, enterpriseRes] = await Promise.all([
         api.getFederationProviders(),
         api.getSocialProviders(),
+        api.getEnterpriseProviders(),
       ]);
       if (fedRes.success && fedRes.data) {
         setFederationProviders(fedRes.data.providers || []);
@@ -63,11 +79,17 @@ function LoginForm() {
       if (socialRes.success && socialRes.data) {
         setSocialProviders(socialRes.data.providers || []);
       }
+      if (enterpriseRes.success && enterpriseRes.data) {
+        const ldap = enterpriseRes.data.ldap_providers || [];
+        setLDAPProviders(ldap);
+        setSAMLProviders(enterpriseRes.data.saml_providers || []);
+        setSelectedLDAPProvider((prev) => prev || ldap[0]?.slug || '');
+      }
     };
     loadProviders();
   }, []);
 
-  /* 检查URL中的错误参数（社交登录回调失败） */
+  /* 检查 URL 中的错误参数（外部登录回调失败） */
   useEffect(() => {
     const errorParam = searchParams.get('error');
     if (errorParam) {
@@ -80,37 +102,42 @@ function LoginForm() {
     setError('');
     setIsLoading(true);
 
-    const result = await login(email, password);
-    
+    const result = activeTab === 'ldap'
+      ? await loginWithLDAP(selectedLDAPProvider, ldapIdentifier, ldapPassword)
+      : await login(email, password);
+
     if (result.success) {
-      if (returnTo.startsWith('http://') || returnTo.startsWith('https://')) {
-        setRedirectUrl(returnTo);
-      } else {
-        router.push(returnTo);
-      }
+      router.push(returnTo);
     } else {
       setError(result.error || t('auth.callback.loginFailed'));
     }
-    
+
     setIsLoading(false);
   };
 
-  /* 处理第三方 OAuth 一键登录 */
-  const handleSocialLogin = (provider: string, type: 'federation' | 'social') => {
+  /* 处理外部一键登录 */
+  const handleExternalLogin = (provider: string, type: ExternalLoginProvider['type']) => {
     if (type === 'federation') {
       setRedirectUrl(api.getFederationLoginUrl(provider, returnTo));
-    } else {
-      setRedirectUrl(api.getSocialLoginUrl(provider, returnTo));
+      return;
     }
+    if (type === 'saml') {
+      setRedirectUrl(api.getSAMLLoginUrl(provider, returnTo));
+      return;
+    }
+    setRedirectUrl(api.getSocialLoginUrl(provider, returnTo));
   };
 
-  const allProviders = [
+  const allProviders: ExternalLoginProvider[] = [
     ...socialProviders.map(p => ({ ...p, type: 'social' as const })),
     ...federationProviders.map(p => ({ slug: p.slug, name: p.name, icon_url: p.icon_url, button_text: p.button_text, type: 'federation' as const })),
+    ...samlProviders.map(p => ({ ...p, type: 'saml' as const })),
   ];
 
+  const submitText = activeTab === 'ldap' ? t('auth.login.directorySubmit') : t('auth.login.submit');
+
   /* 正在检查登录状态或已登录正在跳转 */
-  if (authLoading || isAuthenticated) {
+  if (authLoading || (isAuthenticated && !forceLogin)) {
     return (
       <div className="w-full max-w-md mx-auto flex items-center justify-center min-h-[400px]">
         <div className="text-center">
@@ -150,7 +177,7 @@ function LoginForm() {
               </Alert>
             )}
 
-            {/* 第三方 OAuth 一键登录按钮 */}
+            {/* 第三方与 SAML 一键登录按钮 */}
             {allProviders.length > 0 && (
               <div className="space-y-3">
                 <div className="grid gap-2">
@@ -160,9 +187,9 @@ function LoginForm() {
                       type="button"
                       variant="outline"
                       className="w-full h-11 gap-3 font-medium hover:bg-muted/80 transition-all"
-                      onClick={() => handleSocialLogin(provider.slug, provider.type)}
+                      onClick={() => handleExternalLogin(provider.slug, provider.type)}
                     >
-                      <ProviderIcon slug={provider.slug} className="h-5 w-5" />
+                      <ProviderIcon slug={provider.type === 'saml' ? 'saml' : provider.slug} className="h-5 w-5" />
                       {provider.button_text || t('auth.login.signInWith').replace('{provider}', provider.name)}
                     </Button>
                   ))}
@@ -180,63 +207,152 @@ function LoginForm() {
               </div>
             )}
 
-            <div className="space-y-2">
-              <Label htmlFor="email" className="text-sm font-medium">{t('auth.login.email')}</Label>
-              <div className="relative group">
-                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground transition-colors group-focus-within:text-primary" />
-                <Input
-                  id="email"
-                  type="email"
-                  placeholder="name@example.com"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="pl-10 h-11 bg-muted/50 border-muted focus:bg-background transition-colors"
-                  autoComplete="email"
-                  required
-                  disabled={isLoading}
-                />
-              </div>
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <Label htmlFor="password" className="text-sm font-medium">{t('auth.login.password')}</Label>
-                <Link 
-                  href="/forgot-password" 
-                  className="text-xs text-muted-foreground hover:text-primary transition-colors"
-                >
-                  {t('auth.login.forgotPassword')}
-                </Link>
-              </div>
-              <div className="relative group">
-                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground transition-colors group-focus-within:text-primary" />
-                <Input
-                  id="password"
-                  type={showPassword ? 'text' : 'password'}
-                  placeholder="••••••••"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="pl-10 pr-10 h-11 bg-muted/50 border-muted focus:bg-background transition-colors"
-                  autoComplete="current-password"
-                  required
-                  disabled={isLoading}
-                />
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
-                  onClick={() => setShowPassword(!showPassword)}
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
-                >
-                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
-              </div>
-            </div>
+            <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as LoginTab)} className="space-y-4">
+              <TabsList className="grid w-full grid-cols-2">
+                <TabsTrigger value="local" className="gap-2">
+                  <Mail className="h-4 w-4" />
+                  {t('auth.login.localAccount')}
+                </TabsTrigger>
+                <TabsTrigger value="ldap" className="gap-2">
+                  <Shield className="h-4 w-4" />
+                  {t('auth.login.enterpriseDirectory')}
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="local" className="space-y-4 mt-0">
+                <div className="space-y-2">
+                  <Label htmlFor="email" className="text-sm font-medium">{t('auth.login.email')}</Label>
+                  <div className="relative group">
+                    <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground transition-colors group-focus-within:text-primary" />
+                    <Input
+                      id="email"
+                      type="email"
+                      placeholder="name@example.com"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      className="pl-10 h-11 bg-muted/50 border-muted focus:bg-background transition-colors"
+                      autoComplete="email"
+                      required={activeTab === 'local'}
+                      disabled={isLoading || activeTab !== 'local'}
+                    />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="password" className="text-sm font-medium">{t('auth.login.password')}</Label>
+                    <Link
+                      href="/forgot-password"
+                      className="text-xs text-muted-foreground hover:text-primary transition-colors"
+                    >
+                      {t('auth.login.forgotPassword')}
+                    </Link>
+                  </div>
+                  <div className="relative group">
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground transition-colors group-focus-within:text-primary" />
+                    <Input
+                      id="password"
+                      type={showPassword ? 'text' : 'password'}
+                      placeholder="••••••••"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      className="pl-10 pr-10 h-11 bg-muted/50 border-muted focus:bg-background transition-colors"
+                      autoComplete="current-password"
+                      required={activeTab === 'local'}
+                      disabled={isLoading || activeTab !== 'local'}
+                    />
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+                      onClick={() => setShowPassword(!showPassword)}
+                      aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    >
+                      {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
+                </div>
+              </TabsContent>
+
+              <TabsContent value="ldap" className="space-y-4 mt-0">
+                {ldapProviders.length === 0 && (
+                  <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+                    {t('auth.login.noEnterpriseDirectory')}
+                  </div>
+                )}
+                {ldapProviders.length > 1 && (
+                  <div className="space-y-2">
+                    <Label htmlFor="ldap-provider" className="text-sm font-medium">{t('auth.login.enterpriseProvider')}</Label>
+                    <select
+                      id="ldap-provider"
+                      value={selectedLDAPProvider}
+                      onChange={(e) => setSelectedLDAPProvider(e.target.value)}
+                      className="flex h-11 w-full rounded-md border border-input bg-muted/50 px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                      required={activeTab === 'ldap'}
+                      disabled={isLoading || activeTab !== 'ldap'}
+                    >
+                      {ldapProviders.map((provider) => (
+                        <option key={provider.slug} value={provider.slug}>{provider.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {ldapProviders.length === 1 && (
+                  <div className="rounded-lg border bg-muted/40 p-3 text-sm">
+                    <span className="text-muted-foreground">{t('auth.login.enterpriseProvider')}：</span>
+                    <span className="font-medium">{ldapProviders[0].name}</span>
+                  </div>
+                )}
+                <div className="space-y-2">
+                  <Label htmlFor="ldap-identifier" className="text-sm font-medium">{t('auth.login.enterpriseIdentifier')}</Label>
+                  <div className="relative group">
+                    <Shield className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground transition-colors group-focus-within:text-primary" />
+                    <Input
+                      id="ldap-identifier"
+                      type="text"
+                      placeholder={t('auth.login.enterpriseIdentifierPlaceholder')}
+                      value={ldapIdentifier}
+                      onChange={(e) => setLDAPIdentifier(e.target.value)}
+                      className="pl-10 h-11 bg-muted/50 border-muted focus:bg-background transition-colors"
+                      autoComplete="username"
+                      required={activeTab === 'ldap'}
+                      disabled={isLoading || activeTab !== 'ldap' || ldapProviders.length === 0}
+                    />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ldap-password" className="text-sm font-medium">{t('auth.login.password')}</Label>
+                  <div className="relative group">
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground transition-colors group-focus-within:text-primary" />
+                    <Input
+                      id="ldap-password"
+                      type={showLDAPPassword ? 'text' : 'password'}
+                      placeholder="••••••••"
+                      value={ldapPassword}
+                      onChange={(e) => setLDAPPassword(e.target.value)}
+                      className="pl-10 pr-10 h-11 bg-muted/50 border-muted focus:bg-background transition-colors"
+                      autoComplete="current-password"
+                      required={activeTab === 'ldap'}
+                      disabled={isLoading || activeTab !== 'ldap' || ldapProviders.length === 0}
+                    />
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+                      onClick={() => setShowLDAPPassword(!showLDAPPassword)}
+                      aria-label={showLDAPPassword ? 'Hide password' : 'Show password'}
+                    >
+                      {showLDAPPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
+                </div>
+              </TabsContent>
+            </Tabs>
           </CardContent>
           <CardFooter className="flex flex-col gap-4 pt-2">
-            <Button 
-              type="submit" 
-              className="w-full h-11 text-base font-medium shadow-lg shadow-primary/20 hover:shadow-xl hover:shadow-primary/30 transition-all" 
-              disabled={isLoading}
+            <Button
+              type="submit"
+              className="w-full h-11 text-base font-medium shadow-lg shadow-primary/20 hover:shadow-xl hover:shadow-primary/30 transition-all"
+              disabled={isLoading || (activeTab === 'ldap' && ldapProviders.length === 0)}
             >
               {isLoading ? (
                 <>
@@ -245,12 +361,12 @@ function LoginForm() {
                 </>
               ) : (
                 <>
-                  {t('auth.login.submit')}
+                  {submitText}
                   <ArrowRight className="ml-2 h-4 w-4" />
                 </>
               )}
             </Button>
-            
+
             {allProviders.length === 0 && (
               <div className="relative w-full">
                 <div className="absolute inset-0 flex items-center">

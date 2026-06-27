@@ -1,6 +1,10 @@
 package oauth2
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -66,9 +70,159 @@ func TestDefaultConfig_Defaults(t *testing.T) {
 	if !cfg.UsePKCE {
 		t.Error("UsePKCE should default to true")
 	}
+	if cfg.Issuer != "http://localhost:8080" {
+		t.Fatalf("Issuer=%q want http://localhost:8080", cfg.Issuer)
+	}
 	if len(cfg.Scopes) == 0 {
 		t.Error("Scopes should have defaults")
 	}
+}
+
+func TestSSOConfig_DerivesEndpointsFromIssuerURL(t *testing.T) {
+	cfg := SSOConfig("sso-client", "sso-secret", "http://localhost:8080/", "http://app.example.test/callback")
+
+	if cfg.AuthURL != "http://localhost:8080/oauth/authorize" {
+		t.Fatalf("AuthURL=%q want http://localhost:8080/oauth/authorize", cfg.AuthURL)
+	}
+	if cfg.TokenURL != "http://localhost:8080/oauth/token" {
+		t.Fatalf("TokenURL=%q want http://localhost:8080/oauth/token", cfg.TokenURL)
+	}
+	if cfg.UserInfoURL != "http://localhost:8080/oauth/userinfo" {
+		t.Fatalf("UserInfoURL=%q want http://localhost:8080/oauth/userinfo", cfg.UserInfoURL)
+	}
+	if cfg.Issuer != "http://localhost:8080" {
+		t.Fatalf("Issuer=%q want http://localhost:8080", cfg.Issuer)
+	}
+	if cfg.RedirectURL != "http://app.example.test/callback" {
+		t.Fatalf("RedirectURL=%q want http://app.example.test/callback", cfg.RedirectURL)
+	}
+	if !cfg.UsePKCE {
+		t.Fatal("UsePKCE should default to true")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+}
+
+func TestDiscoverSSOConfig_DiscoversEndpointsFromOpenIDConfiguration(t *testing.T) {
+	var requestedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPath = r.URL.Path
+		if r.URL.Path != "/.well-known/openid-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"issuer":                           serverURL(t, r),
+			"authorization_endpoint":           serverURL(t, r) + "/oauth/authorize",
+			"token_endpoint":                   serverURL(t, r) + "/oauth/token",
+			"userinfo_endpoint":                serverURL(t, r) + "/oauth/userinfo",
+			"code_challenge_methods_supported": []string{"S256"},
+		})
+	}))
+	defer server.Close()
+
+	cfg, err := DiscoverSSOConfig(context.Background(), "client-id", "client-secret", server.URL+"/", "http://app.example.test/callback")
+	if err != nil {
+		t.Fatalf("DiscoverSSOConfig() unexpected error: %v", err)
+	}
+	if requestedPath != "/.well-known/openid-configuration" {
+		t.Fatalf("requested path=%q want /.well-known/openid-configuration", requestedPath)
+	}
+	if cfg.AuthURL != server.URL+"/oauth/authorize" {
+		t.Fatalf("AuthURL=%q want %s/oauth/authorize", cfg.AuthURL, server.URL)
+	}
+	if cfg.TokenURL != server.URL+"/oauth/token" {
+		t.Fatalf("TokenURL=%q want %s/oauth/token", cfg.TokenURL, server.URL)
+	}
+	if cfg.UserInfoURL != server.URL+"/oauth/userinfo" {
+		t.Fatalf("UserInfoURL=%q want %s/oauth/userinfo", cfg.UserInfoURL, server.URL)
+	}
+	if cfg.Issuer != server.URL {
+		t.Fatalf("Issuer=%q want %s", cfg.Issuer, server.URL)
+	}
+	if !cfg.UsePKCE {
+		t.Fatal("UsePKCE should be true when discovery advertises S256")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() unexpected error: %v", err)
+	}
+}
+
+func TestDiscoverSSOConfig_UsesIssuerPathForOpenIDConfiguration(t *testing.T) {
+	var requestedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPath = r.URL.Path
+		if r.URL.Path != "/tenant/.well-known/openid-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		issuer := serverURL(t, r) + "/tenant"
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":                 issuer,
+			"authorization_endpoint": issuer + "/oauth/authorize",
+			"token_endpoint":         issuer + "/oauth/token",
+			"userinfo_endpoint":      issuer + "/oauth/userinfo",
+		})
+	}))
+	defer server.Close()
+
+	cfg, err := DiscoverSSOConfig(context.Background(), "client-id", "client-secret", server.URL+"/tenant/", "http://app.example.test/callback")
+	if err != nil {
+		t.Fatalf("DiscoverSSOConfig() unexpected error: %v", err)
+	}
+	if requestedPath != "/tenant/.well-known/openid-configuration" {
+		t.Fatalf("requested path=%q want /tenant/.well-known/openid-configuration", requestedPath)
+	}
+	if cfg.AuthURL != server.URL+"/tenant/oauth/authorize" {
+		t.Fatalf("AuthURL=%q want %s/tenant/oauth/authorize", cfg.AuthURL, server.URL)
+	}
+	if cfg.Issuer != server.URL+"/tenant" {
+		t.Fatalf("Issuer=%q want %s/tenant", cfg.Issuer, server.URL)
+	}
+}
+
+func TestDiscoverSSOConfig_RejectsIssuerMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":                 serverURL(t, r) + "/other",
+			"authorization_endpoint": serverURL(t, r) + "/oauth/authorize",
+			"token_endpoint":         serverURL(t, r) + "/oauth/token",
+			"userinfo_endpoint":      serverURL(t, r) + "/oauth/userinfo",
+		})
+	}))
+	defer server.Close()
+
+	_, err := DiscoverSSOConfig(context.Background(), "client-id", "client-secret", server.URL, "http://app.example.test/callback")
+	if err == nil || !strings.Contains(err.Error(), "issuer mismatch") {
+		t.Fatalf("DiscoverSSOConfig() error=%v want issuer mismatch", err)
+	}
+}
+
+func TestDiscoverSSOConfig_RejectsMissingUserInfoEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"issuer":                 serverURL(t, r),
+			"authorization_endpoint": serverURL(t, r) + "/oauth/authorize",
+			"token_endpoint":         serverURL(t, r) + "/oauth/token",
+		})
+	}))
+	defer server.Close()
+
+	_, err := DiscoverSSOConfig(context.Background(), "client-id", "client-secret", server.URL, "http://app.example.test/callback")
+	if err == nil || !strings.Contains(err.Error(), "userinfo_endpoint") {
+		t.Fatalf("DiscoverSSOConfig() error=%v want missing userinfo_endpoint", err)
+	}
+}
+
+func serverURL(t *testing.T, r *http.Request) string {
+	t.Helper()
+
+	return "http://" + r.Host
 }
 
 /* ========== MemoryTokenStore ========== */

@@ -64,10 +64,6 @@ func (g *GormLogger) Error(ctx context.Context, msg string, data ...interface{})
 }
 
 func (g *GormLogger) Trace(ctx context.Context, begin time.Time, fc func() (sql string, rowsAffected int64), err error) {
-	if g.Silent {
-		return
-	}
-
 	elapsed := time.Since(begin)
 	sql, rows := fc()
 
@@ -89,7 +85,7 @@ func (g *GormLogger) Trace(ctx context.Context, begin time.Time, fc func() (sql 
 			"rows", rows,
 			"sql", truncateSQL(sql, 100),
 		)
-	case g.LogLevel >= gormlogger.Info:
+	case !g.Silent && g.LogLevel >= gormlogger.Info:
 		// Only log non-trivial queries
 		if rows > 0 || elapsed > 10*time.Millisecond {
 			g.logger.Debug("DB Query",

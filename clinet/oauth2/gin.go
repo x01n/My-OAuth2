@@ -46,16 +46,7 @@ func (c *Client) GinMiddleware() gin.HandlerFunc {
 
 		// Optionally fetch user info
 		if c.config.UserInfoURL != "" {
-			// Create a temporary client with this token
-			tempStore := NewMemoryTokenStore()
-			tempStore.SetToken(token)
-
-			oldStore := c.tokenStore
-			c.tokenStore = tempStore
-
-			userInfo, err := c.GetUserInfo(ctx.Request.Context())
-			c.tokenStore = oldStore
-
+			userInfo, err := c.getUserInfoWithAccessToken(ctx.Request.Context(), tokenString)
 			if err != nil {
 				ctx.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 					"error": "invalid token",

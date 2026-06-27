@@ -13,16 +13,20 @@ func (s *OAuthService) SetJWTManager(m *jwt.Manager) {
 /*
  * enrichTokenResultWithIDToken 在 scope 含 openid 时附加 id_token
  */
-func (s *OAuthService) enrichTokenResultWithIDToken(result *TokenResult, user *model.User, clientID, scope string) error {
+func (s *OAuthService) enrichTokenResultWithIDToken(result *TokenResult, user *model.User, clientID, issuer, scope, nonce string, authTime int64, amr []string) error {
 	if result == nil || user == nil || s.jwtManager == nil || !model.ScopeContainsOpenID(scope) {
 		return nil
+	}
+	app, err := s.appRepo.FindByClientID(clientID)
+	if err != nil {
+		return ErrInvalidClient
 	}
 	ttl := s.config.OAuth.IDTokenTTL
 	if ttl <= 0 {
 		ttl = s.config.OAuth.AccessTokenTTL
 	}
-	idt, err := s.jwtManager.GenerateIDToken(
-		user.ID, user.Email, user.Username, string(user.Role), clientID, scope, ttl,
+	idt, err := s.jwtManager.GenerateClientIDTokenWithIssuerAndNonceAndAuthTimeAndAMRAndATHash(
+		user.ID, user.Email, user.Username, string(user.Role), clientID, app.ClientSecret, issuer, scope, nonce, authTime, amr, jwt.AccessTokenHash(result.AccessToken), ttl,
 	)
 	if err != nil {
 		return err

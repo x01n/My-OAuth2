@@ -456,13 +456,15 @@ func (s *AnomalyDetectionService) RecordLoginAttempt(
 	success bool,
 	failureReason string,
 ) (*AnomalyResult, error) {
-	// 记录登录日志
-	s.loginLogRepo.CreateLoginLog(userID, appID, loginType, ipAddress, userAgent, email, success, failureReason)
-
-	// 如果用户ID存在且登录成功，检测异常
+	result := &AnomalyResult{}
+	var err error
 	if userID != nil && success {
-		return s.CheckLoginAnomaly(*userID, ipAddress, userAgent)
+		result, err = s.CheckLoginAnomaly(*userID, ipAddress, userAgent)
 	}
 
-	return &AnomalyResult{}, nil
+	if logErr := s.loginLogRepo.CreateLoginLog(userID, appID, loginType, ipAddress, userAgent, email, success, failureReason); logErr != nil && err == nil {
+		err = logErr
+	}
+
+	return result, err
 }

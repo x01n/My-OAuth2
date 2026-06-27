@@ -42,7 +42,7 @@ server/data/*.db-wal
 
 # Logs
 *.log
-logs/
+/logs/
 
 # Server binary
 server/server
@@ -64,3 +64,4 @@ docker-data/
 
 # Client examples
 clinet/examples/*/tmp/
+.serena/

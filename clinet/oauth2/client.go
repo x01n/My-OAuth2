@@ -33,6 +33,7 @@ var (
 	ErrInvalidClient       = errors.New("oauth2: invalid client credentials")
 	ErrInvalidScope        = errors.New("oauth2: invalid scope")
 	ErrAccessDenied        = errors.New("oauth2: access denied")
+	ErrConflict            = errors.New("oauth2: conflict")
 	ErrMaxRetriesExhausted = errors.New("oauth2: max retries exhausted")
 )
 
@@ -48,7 +49,13 @@ type OAuthError struct {
 
 func (e *OAuthError) Error() string {
 	if e.Description != "" {
+		if e.StatusCode == 0 {
+			return fmt.Sprintf("oauth2: %s - %s", e.Code, e.Description)
+		}
 		return fmt.Sprintf("oauth2: %s - %s (HTTP %d)", e.Code, e.Description, e.StatusCode)
+	}
+	if e.StatusCode == 0 {
+		return fmt.Sprintf("oauth2: %s", e.Code)
 	}
 	return fmt.Sprintf("oauth2: %s (HTTP %d)", e.Code, e.StatusCode)
 }
@@ -341,20 +348,24 @@ func (c *Client) GetToken(ctx context.Context) (*Token, error) {
 
 // GetUserInfo fetches user information from the userinfo endpoint
 func (c *Client) GetUserInfo(ctx context.Context) (*UserInfo, error) {
-	if c.config.UserInfoURL == "" {
-		return nil, errors.New("oauth2: userinfo_url not configured")
-	}
-
 	token, err := c.GetToken(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	return c.getUserInfoWithAccessToken(ctx, token.AccessToken)
+}
+
+func (c *Client) getUserInfoWithAccessToken(ctx context.Context, accessToken string) (*UserInfo, error) {
+	if c.config.UserInfoURL == "" {
+		return nil, errors.New("oauth2: userinfo_url not configured")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", c.config.UserInfoURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token.AccessToken))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -380,6 +391,79 @@ func (c *Client) GetUserInfo(ctx context.Context) (*UserInfo, error) {
 	return &userInfo, nil
 }
 
+func deriveOAuthEndpoint(tokenURL, endpoint string) string {
+	u, err := url.Parse(tokenURL)
+	if err != nil {
+		return strings.TrimSuffix(tokenURL, "/token") + "/" + strings.TrimPrefix(endpoint, "/")
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/token") + "/" + strings.TrimPrefix(endpoint, "/")
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+func parseOAuthHTTPError(resp *http.Response, body []byte, defaultCode string) error {
+	var errResp struct {
+		Error       string `json:"error"`
+		Description string `json:"error_description"`
+	}
+	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
+		return &OAuthError{
+			Code:        errResp.Error,
+			Description: errResp.Description,
+			StatusCode:  resp.StatusCode,
+		}
+	}
+	return &OAuthError{
+		Code:       defaultCode,
+		StatusCode: resp.StatusCode,
+	}
+}
+
+func parseSDKAPIError(statusCode int, body []byte, operation string) error {
+	var errResp struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &errResp) == nil {
+		switch errResp.Error.Code {
+		case "INVALID_CLIENT":
+			return ErrInvalidClient
+		case "FORBIDDEN", "ACCESS_DENIED":
+			return ErrAccessDenied
+		case "USER_DISABLED":
+			return ErrAccessDenied
+		case "CONFLICT":
+			return ErrConflict
+		case "TOKEN_EXPIRED", "TOKEN_INVALID":
+			return ErrTokenExpired
+		case "UNAUTHORIZED":
+			switch errResp.Error.Message {
+			case "Invalid client credentials":
+				return ErrInvalidClient
+			case "Invalid or expired access token", "Invalid or expired refresh token":
+				return ErrTokenExpired
+			}
+		}
+	}
+	if statusCode == http.StatusUnauthorized {
+		return ErrTokenExpired
+	}
+	if statusCode == http.StatusForbidden {
+		return ErrAccessDenied
+	}
+	if statusCode == http.StatusConflict {
+		return ErrConflict
+	}
+	return fmt.Errorf("oauth2: %s failed with status %d", operation, statusCode)
+}
+
+func parseSDKVerifyError(statusCode int, body []byte) error {
+	return parseSDKAPIError(statusCode, body, "validate token")
+}
+
 /*
  * RevokeToken 撤销令牌 (RFC 7009)
  * 功能：向服务端 revoke 端点发送撤销请求，同时清除本地存储
@@ -398,8 +482,7 @@ func (c *Client) RevokeToken(ctx context.Context, tokenTypeHint string) error {
 		revokeToken = token.RefreshToken
 	}
 
-	/* 推导 revoke URL：将 TokenURL 的 /token 路径替换为 /revoke */
-	revokeURL := strings.Replace(c.config.TokenURL, "/token", "/revoke", 1)
+	revokeURL := deriveOAuthEndpoint(c.config.TokenURL, "revoke")
 
 	data := url.Values{}
 	data.Set("token", revokeToken)
@@ -421,7 +504,15 @@ func (c *Client) RevokeToken(ctx context.Context, tokenTypeHint string) error {
 	if doErr != nil {
 		return doErr
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return parseOAuthHTTPError(resp, body, "unknown_error")
+	}
 
 	c.logger.Debug("Token revoked successfully")
 
@@ -438,8 +529,7 @@ func (c *Client) RevokeToken(ctx context.Context, tokenTypeHint string) error {
  * @return map[string]interface{} - 自省结果
  */
 func (c *Client) IntrospectToken(ctx context.Context, token string, tokenTypeHint string) (map[string]interface{}, error) {
-	/* 推导 introspect URL */
-	introspectURL := strings.Replace(c.config.TokenURL, "/token", "/introspect", 1)
+	introspectURL := deriveOAuthEndpoint(c.config.TokenURL, "introspect")
 
 	data := url.Values{}
 	data.Set("token", token)
@@ -466,6 +556,10 @@ func (c *Client) IntrospectToken(ctx context.Context, token string, tokenTypeHin
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 	if err != nil {
 		return nil, err
+	}
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, parseOAuthHTTPError(resp, body, "unknown_error")
 	}
 
 	var result map[string]interface{}
@@ -648,7 +742,14 @@ func (c *Client) doTokenRequest(ctx context.Context, data url.Values) (*Token, e
 			}
 		}
 
-		return parseTokenResponse(body)
+		token, err := parseTokenResponse(body)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.validateTokenIDToken(token); err != nil {
+			return nil, err
+		}
+		return token, nil
 	}
 
 	return nil, fmt.Errorf("oauth2: token request failed after %d retries: %w", maxRetries, lastErr)
@@ -692,15 +793,19 @@ type AddressInfo struct {
 
 // SDKRegisterRequest represents SDK registration request
 type SDKRegisterRequest struct {
-	Email    string `json:"email"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Email          string `json:"email"`
+	Username       string `json:"username"`
+	Password       string `json:"password"`
+	ExternalID     string `json:"external_id,omitempty"`
+	ExternalSource string `json:"external_source,omitempty"`
 }
 
 // SDKLoginRequest represents SDK login request
 type SDKLoginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email          string `json:"email"`
+	Password       string `json:"password"`
+	ExternalID     string `json:"external_id,omitempty"`
+	ExternalSource string `json:"external_source,omitempty"`
 }
 
 // SDKUserResponse represents user info in SDK response
@@ -715,9 +820,32 @@ type SDKUserResponse struct {
 type SDKTokenResponse struct {
 	AccessToken  string          `json:"access_token"`
 	RefreshToken string          `json:"refresh_token"`
+	IDToken      string          `json:"id_token,omitempty"`
 	TokenType    string          `json:"token_type"`
 	ExpiresIn    int64           `json:"expires_in"`
 	User         SDKUserResponse `json:"user"`
+}
+
+func tokenFromSDKTokenResponse(resp *SDKTokenResponse) *Token {
+	token := &Token{
+		AccessToken:  resp.AccessToken,
+		RefreshToken: resp.RefreshToken,
+		IDToken:      resp.IDToken,
+		TokenType:    resp.TokenType,
+	}
+	token.SetExpiry(resp.ExpiresIn)
+	return token
+}
+
+func (c *Client) storeSDKTokenResponse(resp *SDKTokenResponse) (*Token, error) {
+	token := tokenFromSDKTokenResponse(resp)
+	if err := c.validateTokenIDToken(token); err != nil {
+		return nil, err
+	}
+	if err := c.tokenStore.SetToken(token); err != nil {
+		return nil, err
+	}
+	return token, nil
 }
 
 // RegisterUser registers a new user via SDK API
@@ -731,6 +859,12 @@ func (c *Client) RegisterUser(ctx context.Context, req *SDKRegisterRequest) (*SD
 		"email":         req.Email,
 		"username":      req.Username,
 		"password":      req.Password,
+	}
+	if req.ExternalID != "" {
+		payload["external_id"] = req.ExternalID
+	}
+	if req.ExternalSource != "" {
+		payload["external_source"] = req.ExternalSource
 	}
 
 	body, err := json.Marshal(payload)
@@ -756,13 +890,7 @@ func (c *Client) RegisterUser(ctx context.Context, req *SDKRegisterRequest) (*SD
 	}
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
-			return nil, fmt.Errorf("oauth2: %s", errResp.Error)
-		}
-		return nil, fmt.Errorf("oauth2: register failed with status %d", resp.StatusCode)
+		return nil, parseSDKAPIError(resp.StatusCode, respBody, "register")
 	}
 
 	var result struct {
@@ -773,13 +901,7 @@ func (c *Client) RegisterUser(ctx context.Context, req *SDKRegisterRequest) (*SD
 	}
 
 	// Store token
-	token := &Token{
-		AccessToken:  result.Data.AccessToken,
-		RefreshToken: result.Data.RefreshToken,
-		TokenType:    result.Data.TokenType,
-	}
-	token.SetExpiry(result.Data.ExpiresIn)
-	if err := c.tokenStore.SetToken(token); err != nil {
+	if _, err := c.storeSDKTokenResponse(&result.Data); err != nil {
 		return nil, err
 	}
 
@@ -796,6 +918,12 @@ func (c *Client) LoginUser(ctx context.Context, req *SDKLoginRequest) (*SDKToken
 		"client_secret": c.config.ClientSecret,
 		"email":         req.Email,
 		"password":      req.Password,
+	}
+	if req.ExternalID != "" {
+		payload["external_id"] = req.ExternalID
+	}
+	if req.ExternalSource != "" {
+		payload["external_source"] = req.ExternalSource
 	}
 
 	body, err := json.Marshal(payload)
@@ -821,13 +949,7 @@ func (c *Client) LoginUser(ctx context.Context, req *SDKLoginRequest) (*SDKToken
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
-			return nil, fmt.Errorf("oauth2: %s", errResp.Error)
-		}
-		return nil, fmt.Errorf("oauth2: login failed with status %d", resp.StatusCode)
+		return nil, parseSDKAPIError(resp.StatusCode, respBody, "login")
 	}
 
 	var result struct {
@@ -838,22 +960,96 @@ func (c *Client) LoginUser(ctx context.Context, req *SDKLoginRequest) (*SDKToken
 	}
 
 	// Store token
-	token := &Token{
-		AccessToken:  result.Data.AccessToken,
-		RefreshToken: result.Data.RefreshToken,
-		TokenType:    result.Data.TokenType,
-	}
-	token.SetExpiry(result.Data.ExpiresIn)
-	if err := c.tokenStore.SetToken(token); err != nil {
+	if _, err := c.storeSDKTokenResponse(&result.Data); err != nil {
 		return nil, err
 	}
 
 	return &result.Data, nil
 }
 
-// SignTokenRequest represents custom token signing request
+// RefreshSDKUserToken refreshes the SDK user token through /api/sdk/refresh.
+func (c *Client) RefreshSDKUserToken(ctx context.Context) (*SDKTokenResponse, error) {
+	token, err := c.tokenStore.GetToken()
+	if err != nil {
+		return nil, err
+	}
+	if token == nil || token.RefreshToken == "" {
+		return nil, errors.New("oauth2: no refresh token available")
+	}
+
+	apiURL := strings.TrimSuffix(c.config.AuthURL, "/oauth/authorize")
+	refreshURL := apiURL + "/api/sdk/refresh"
+
+	payload := map[string]string{
+		"client_id":     c.config.ClientID,
+		"client_secret": c.config.ClientSecret,
+		"refresh_token": token.RefreshToken,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", refreshURL, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, parseSDKAPIError(resp.StatusCode, respBody, "refresh SDK user token")
+	}
+
+	var result struct {
+		Data SDKTokenResponse `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, err
+	}
+
+	if _, err := c.storeSDKTokenResponse(&result.Data); err != nil {
+		return nil, err
+	}
+
+	return &result.Data, nil
+}
+
+// EnsureSDKUserToken returns a valid SDK user token, refreshing via /api/sdk/refresh when expired.
+func (c *Client) EnsureSDKUserToken(ctx context.Context) (*Token, error) {
+	token, err := c.tokenStore.GetToken()
+	if err != nil {
+		return nil, err
+	}
+	if token == nil {
+		return nil, ErrNoToken
+	}
+	if !token.IsExpired() {
+		return token, nil
+	}
+	if token.RefreshToken == "" {
+		return nil, ErrTokenExpired
+	}
+
+	resp, err := c.RefreshSDKUserToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return tokenFromSDKTokenResponse(resp), nil
+}
+
+// SignTokenRequest represents service token signing request
 type SignTokenRequest struct {
-	UserID    string                 `json:"user_id"`
 	Claims    map[string]interface{} `json:"claims,omitempty"`
 	ExpiresIn int64                  `json:"expires_in,omitempty"`
 }
@@ -865,7 +1061,7 @@ type SignTokenResponse struct {
 	ExpiresIn int64  `json:"expires_in"`
 }
 
-// SignToken signs a custom token for a user
+// SignToken signs a client-scoped service token.
 func (c *Client) SignToken(ctx context.Context, req *SignTokenRequest) (*SignTokenResponse, error) {
 	apiURL := strings.TrimSuffix(c.config.AuthURL, "/oauth/authorize")
 	signURL := apiURL + "/token/sign"
@@ -873,7 +1069,6 @@ func (c *Client) SignToken(ctx context.Context, req *SignTokenRequest) (*SignTok
 	payload := map[string]interface{}{
 		"client_id":     c.config.ClientID,
 		"client_secret": c.config.ClientSecret,
-		"user_id":       req.UserID,
 	}
 	if req.Claims != nil {
 		payload["claims"] = req.Claims
@@ -934,13 +1129,15 @@ type LegacySyncUserRequest struct {
 
 // LegacySyncUserResponse 旧版用户同步响应
 type LegacySyncUserResponse struct {
-	UserID      string `json:"user_id"`
-	Email       string `json:"email"`
-	Username    string `json:"username"`
-	Created     bool   `json:"created"`
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int64  `json:"expires_in"`
+	UserID       string `json:"user_id"`
+	Email        string `json:"email"`
+	Username     string `json:"username"`
+	Created      bool   `json:"created"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	IDToken      string `json:"id_token,omitempty"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int64  `json:"expires_in"`
 }
 
 // LegacySyncUser 旧版同步用户（需要密码，会生成token）
@@ -955,13 +1152,15 @@ func (c *Client) LegacySyncUser(ctx context.Context, req *LegacySyncUserRequest)
 
 	if err == nil {
 		return &LegacySyncUserResponse{
-			UserID:      loginResp.User.ID,
-			Email:       loginResp.User.Email,
-			Username:    loginResp.User.Username,
-			Created:     false,
-			AccessToken: loginResp.AccessToken,
-			TokenType:   loginResp.TokenType,
-			ExpiresIn:   loginResp.ExpiresIn,
+			UserID:       loginResp.User.ID,
+			Email:        loginResp.User.Email,
+			Username:     loginResp.User.Username,
+			Created:      false,
+			AccessToken:  loginResp.AccessToken,
+			RefreshToken: loginResp.RefreshToken,
+			IDToken:      loginResp.IDToken,
+			TokenType:    loginResp.TokenType,
+			ExpiresIn:    loginResp.ExpiresIn,
 		}, nil
 	}
 
@@ -977,28 +1176,40 @@ func (c *Client) LegacySyncUser(ctx context.Context, req *LegacySyncUserRequest)
 	}
 
 	return &LegacySyncUserResponse{
-		UserID:      registerResp.User.ID,
-		Email:       registerResp.User.Email,
-		Username:    registerResp.User.Username,
-		Created:     true,
-		AccessToken: registerResp.AccessToken,
-		TokenType:   registerResp.TokenType,
-		ExpiresIn:   registerResp.ExpiresIn,
+		UserID:       registerResp.User.ID,
+		Email:        registerResp.User.Email,
+		Username:     registerResp.User.Username,
+		Created:      true,
+		AccessToken:  registerResp.AccessToken,
+		RefreshToken: registerResp.RefreshToken,
+		IDToken:      registerResp.IDToken,
+		TokenType:    registerResp.TokenType,
+		ExpiresIn:    registerResp.ExpiresIn,
 	}, nil
 }
 
-// ValidateUserToken validates a user token and returns user info
+// ValidateUserToken validates an SDK user token and returns user info.
 func (c *Client) ValidateUserToken(ctx context.Context, token string) (*UserInfo, error) {
 	c.logger.Debug("Validating user token")
 
 	apiURL := strings.TrimSuffix(c.config.AuthURL, "/oauth/authorize")
-	userInfoURL := apiURL + "/oauth/userinfo"
+	verifyURL := apiURL + "/api/sdk/verify"
 
-	httpReq, err := http.NewRequestWithContext(ctx, "GET", userInfoURL, nil)
+	payload := map[string]string{
+		"client_id":     c.config.ClientID,
+		"client_secret": c.config.ClientSecret,
+		"access_token":  token,
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("Authorization", "Bearer "+token)
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", verifyURL, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -1006,22 +1217,55 @@ func (c *Client) ValidateUserToken(ctx context.Context, token string) (*UserInfo
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, ErrTokenExpired
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("oauth2: validate token failed with status %d", resp.StatusCode)
-	}
-
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, parseSDKVerifyError(resp.StatusCode, respBody)
+	}
 
-	var userInfo UserInfo
-	if err := json.Unmarshal(respBody, &userInfo); err != nil {
+	var result struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Valid bool `json:"valid"`
+			User  struct {
+				ID            string `json:"id"`
+				Email         string `json:"email"`
+				Username      string `json:"username"`
+				Role          string `json:"role"`
+				EmailVerified bool   `json:"email_verified"`
+				Name          string `json:"name"`
+				Avatar        string `json:"avatar"`
+			} `json:"user"`
+			Claims struct {
+				Sub      string `json:"sub"`
+				Email    string `json:"email"`
+				Role     string `json:"role"`
+				ClientID string `json:"client_id"`
+			} `json:"claims"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, err
+	}
+	if !result.Success || !result.Data.Valid {
+		return nil, ErrTokenExpired
+	}
+
+	userInfo := UserInfo{
+		Sub:               result.Data.User.ID,
+		Email:             result.Data.User.Email,
+		EmailVerified:     result.Data.User.EmailVerified,
+		Name:              result.Data.User.Name,
+		PreferredUsername: result.Data.User.Username,
+		Picture:           result.Data.User.Avatar,
+	}
+	if userInfo.Sub == "" {
+		userInfo.Sub = result.Data.Claims.Sub
+	}
+	if userInfo.Email == "" {
+		userInfo.Email = result.Data.Claims.Email
 	}
 
 	return &userInfo, nil
@@ -1069,18 +1313,19 @@ func (c *Client) HealthCheck(ctx context.Context) (map[string]interface{}, error
 
 // SyncUserRequest 用户同步请求
 type SyncUserRequest struct {
-	Email         string `json:"email"`
-	Username      string `json:"username"`
-	ExternalID    string `json:"external_id,omitempty"`
-	Password      string `json:"password,omitempty"`
-	GivenName     string `json:"given_name,omitempty"`
-	FamilyName    string `json:"family_name,omitempty"`
-	Nickname      string `json:"nickname,omitempty"`
-	Gender        string `json:"gender,omitempty"`
-	Birthdate     string `json:"birthdate,omitempty"`
-	PhoneNumber   string `json:"phone_number,omitempty"`
-	Avatar        string `json:"avatar,omitempty"`
-	EmailVerified bool   `json:"email_verified,omitempty"`
+	Email          string `json:"email"`
+	Username       string `json:"username"`
+	ExternalID     string `json:"external_id,omitempty"`
+	ExternalSource string `json:"external_source,omitempty"`
+	Password       string `json:"password,omitempty"`
+	GivenName      string `json:"given_name,omitempty"`
+	FamilyName     string `json:"family_name,omitempty"`
+	Nickname       string `json:"nickname,omitempty"`
+	Gender         string `json:"gender,omitempty"`
+	Birthdate      string `json:"birthdate,omitempty"`
+	PhoneNumber    string `json:"phone_number,omitempty"`
+	Avatar         string `json:"avatar,omitempty"`
+	EmailVerified  bool   `json:"email_verified,omitempty"`
 }
 
 // SyncUserResponse 用户同步响应
@@ -1109,6 +1354,9 @@ func (c *Client) SyncUser(ctx context.Context, req *SyncUserRequest) (*SyncUserR
 
 	if req.ExternalID != "" {
 		payload["external_id"] = req.ExternalID
+	}
+	if req.ExternalSource != "" {
+		payload["external_source"] = req.ExternalSource
 	}
 	if req.Password != "" {
 		payload["password"] = req.Password

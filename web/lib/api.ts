@@ -2,6 +2,7 @@ import type {
   ApiResponse,
   User,
   UserRole,
+  AuthTokens,
   LoginRequest,
   RegisterRequest,
   LoginResponse,
@@ -14,6 +15,7 @@ import type {
   AdminStats,
   LoginTrend,
   LoginLog,
+  RiskEventsResponse,
   AppStats,
   UserAuthorization,
   Webhook,
@@ -24,6 +26,12 @@ import type {
   SystemConfigUpdate,
   FederationProvider,
   CreateFederationProviderRequest,
+  EnterpriseProvidersResponse,
+  LDAPLoginRequest,
+  LDAPProviderConfig,
+  LDAPProviderUpdateRequest,
+  SAMLProviderConfig,
+  SAMLProviderUpdateRequest,
   SocialProvider,
 } from './types';
 
@@ -39,42 +47,35 @@ function getCookie(name: string): string | null {
 
 class ApiClient {
   private accessToken: string | null = null;
+  private tokenExpiresAt: number | null = null;
   private isRefreshing = false;
-  private refreshPromise: Promise<boolean> | null = null;
+  private refreshPromise: Promise<ApiResponse<AuthTokens>> | null = null;
 
   /*
-   * 请求去重：防止同一 mutation 请求在上一次未完成时重复发送
-   * key = method + endpoint，value = 进行中的 Promise
-   * 仅对 POST/PUT/DELETE 等写操作生效，GET 请求不去重
+   * 请求去重：仅复用明确允许防重的 mutation 请求。
+   * key = method + endpoint + body，避免相同 endpoint 不同 payload 被误复用。
    */
   private inflightMutations = new Map<string, Promise<ApiResponse<unknown>>>();
 
-  constructor() {
-    if (typeof window !== 'undefined') {
-      this.accessToken = localStorage.getItem('access_token');
-    }
-  }
+  constructor() {}
 
-  setAccessToken(token: string | null) {
+  setAccessToken(token: string | null, expiresIn?: number) {
     this.accessToken = token;
-    if (typeof window !== 'undefined') {
-      if (token) {
-        localStorage.setItem('access_token', token);
-      } else {
-        localStorage.removeItem('access_token');
-      }
-    }
+    this.tokenExpiresAt = token && expiresIn ? Date.now() + expiresIn * 1000 : null;
   }
 
   getAccessToken(): string | null {
     return this.accessToken;
   }
 
+  getAccessTokenExpiresAt(): number | null {
+    return this.tokenExpiresAt;
+  }
+
   /**
-   * 尝试刷新 token（防止并发多次刷新）
-   * 返回 true 表示刷新成功，false 表示失败
+   * 尝试刷新 token（防止并发多次刷新），返回后端完整 token 字段。
    */
-  private async tryRefresh(): Promise<boolean> {
+  private async tryRefresh(): Promise<ApiResponse<AuthTokens>> {
     if (this.isRefreshing && this.refreshPromise) {
       return this.refreshPromise;
     }
@@ -82,9 +83,6 @@ class ApiClient {
     this.isRefreshing = true;
     this.refreshPromise = (async () => {
       try {
-        const refreshToken = typeof window !== 'undefined' ? localStorage.getItem('refresh_token') : null;
-        if (!refreshToken) return false;
-
         const url = `${API_BASE_URL}/api/auth/refresh`;
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
         const csrfToken = getCookie('csrf_token');
@@ -93,25 +91,23 @@ class ApiClient {
         const response = await fetch(url, {
           method: 'POST',
           headers,
-          body: JSON.stringify({ refresh_token: refreshToken }),
           credentials: 'include',
         });
 
-        if (!response.ok) return false;
+        if (!response.ok) {
+          return { success: false, error: { code: 'REFRESH_FAILED', message: 'Failed to refresh token' } };
+        }
 
         const data = await response.json();
         const tokenData = data.data || data;
 
         if (tokenData.access_token) {
-          this.setAccessToken(tokenData.access_token);
-          if (tokenData.refresh_token && typeof window !== 'undefined') {
-            localStorage.setItem('refresh_token', tokenData.refresh_token);
-          }
-          return true;
+          this.setAccessToken(tokenData.access_token, tokenData.expires_in);
+          return { success: true, data: tokenData as AuthTokens };
         }
-        return false;
+        return { success: false, error: { code: 'REFRESH_FAILED', message: 'Refresh response missing access_token' } };
       } catch {
-        return false;
+        return { success: false, error: { code: 'REFRESH_FAILED', message: 'Failed to refresh token' } };
       } finally {
         this.isRefreshing = false;
         this.refreshPromise = null;
@@ -126,10 +122,11 @@ class ApiClient {
     options: RequestInit = {},
     _isRetry = false
   ): Promise<ApiResponse<T>> {
-    /* 请求去重：mutation 请求（POST/PUT/DELETE）如果已有同 endpoint 的请求在飞行中，直接复用 */
+    /* 请求去重：仅对显式允许的 mutation 启用，并把 body 纳入 key，避免误复用不同提交。 */
     const method = (options.method || 'GET').toUpperCase();
-    if (method !== 'GET' && method !== 'HEAD' && !_isRetry) {
-      const dedupeKey = `${method}:${endpoint}`;
+    const allowDedupe = !_isRetry && this.shouldDedupeRequest(endpoint, method);
+    if (allowDedupe) {
+      const dedupeKey = `${method}:${endpoint}:${this.stableBodyKey(options.body)}`;
       const inflight = this.inflightMutations.get(dedupeKey);
       if (inflight) {
         return inflight as Promise<ApiResponse<T>>;
@@ -181,10 +178,10 @@ class ApiClient {
 
       clearTimeout(timeoutId);
 
-      const data = await response.json();
+      const data = await this.parseResponseBody(response);
 
       if (!response.ok) {
-        const error = data.error || { code: 'UNKNOWN', message: 'An error occurred' };
+        const error = this.extractError(data);
 
         /* 自动刷新：当 access token 过期时，尝试用 refresh token 换取新 token 并重试 */
         if (
@@ -195,7 +192,7 @@ class ApiClient {
           !endpoint.includes('/api/auth/login')
         ) {
           const refreshed = await this.tryRefresh();
-          if (refreshed) {
+          if (refreshed.success) {
             return this.request<T>(endpoint, options, true);
           }
         }
@@ -216,12 +213,10 @@ class ApiClient {
         return { success: false, error };
       }
 
-      // Handle responses that already have success/data structure
-      if ('success' in data) {
-        return data;
+      if (data && typeof data === 'object' && 'success' in data) {
+        return data as ApiResponse<T>;
       }
 
-      // Wrap raw data in standard response format
       return {
         success: true,
         data: data as T,
@@ -248,6 +243,55 @@ class ApiClient {
     }
   }
 
+  private shouldDedupeRequest(endpoint: string, method: string): boolean {
+    if (method !== 'POST' && method !== 'PUT' && method !== 'DELETE') {
+      return false;
+    }
+    return endpoint === '/api/auth/logout' || endpoint === '/api/auth/refresh';
+  }
+
+  private stableBodyKey(body: RequestInit['body']): string {
+    if (typeof body === 'string') {
+      return body;
+    }
+    if (body == null) {
+      return '';
+    }
+    return '[non-string-body]';
+  }
+
+  private async parseResponseBody(response: Response): Promise<unknown> {
+    if (response.status === 204) {
+      return undefined;
+    }
+    const contentType = response.headers.get('Content-Type') || '';
+    if (contentType.includes('application/json')) {
+      return response.json();
+    }
+    const text = await response.text();
+    return text ? { message: text } : undefined;
+  }
+
+  private extractError(data: unknown): { code: string; message: string; retryAfter?: number } {
+    if (data && typeof data === 'object' && 'error' in data) {
+      const error = (data as { error?: { code?: string; message?: string; retryAfter?: number } }).error;
+      if (error) {
+        return {
+          code: error.code || 'UNKNOWN',
+          message: error.message || 'An error occurred',
+          retryAfter: error.retryAfter,
+        };
+      }
+    }
+    if (data && typeof data === 'object' && 'message' in data) {
+      return {
+        code: 'UNKNOWN',
+        message: String((data as { message: unknown }).message),
+      };
+    }
+    return { code: 'UNKNOWN', message: 'An error occurred' };
+  }
+
   // Auth endpoints
   async register(data: RegisterRequest): Promise<ApiResponse<User>> {
     return this.request<User>('/api/auth/register', {
@@ -262,22 +306,32 @@ class ApiClient {
       body: JSON.stringify(data),
     });
 
-    if (response.success && response.data) {
-      this.setAccessToken(response.data.tokens.access_token);
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('refresh_token', response.data.tokens.refresh_token);
-      }
-    }
+    this.applyLoginResponse(response);
 
     return response;
+  }
+
+  async loginWithLDAP(data: LDAPLoginRequest): Promise<ApiResponse<LoginResponse>> {
+    const response = await this.request<LoginResponse>(`/api/federation/ldap/${encodeURIComponent(data.provider_slug)}/login`, {
+      method: 'POST',
+      body: JSON.stringify({ identifier: data.identifier, password: data.password }),
+    });
+
+    this.applyLoginResponse(response);
+
+    return response;
+  }
+
+  private applyLoginResponse(response: ApiResponse<LoginResponse>) {
+    if (response.success && response.data) {
+      const tokenData = response.data.access_token ? response.data : response.data.tokens;
+      this.setAccessToken(tokenData.access_token, tokenData.expires_in);
+    }
   }
 
   async logout(): Promise<void> {
     await this.request('/api/auth/logout', { method: 'POST' });
     this.setAccessToken(null);
-    if (typeof window !== 'undefined') {
-      localStorage.removeItem('refresh_token');
-    }
   }
 
   // Password reset endpoints
@@ -302,19 +356,9 @@ class ApiClient {
     });
   }
 
-  async refreshToken(): Promise<ApiResponse<{ access_token: string; refresh_token: string }>> {
+  async refreshToken(): Promise<ApiResponse<AuthTokens>> {
     /* 统一走 tryRefresh() 去重锁，避免与 401 自动重试产生竞态 */
-    const success = await this.tryRefresh();
-    if (success) {
-      return {
-        success: true,
-        data: {
-          access_token: this.accessToken || '',
-          refresh_token: (typeof window !== 'undefined' ? localStorage.getItem('refresh_token') : null) || '',
-        },
-      };
-    }
-    return { success: false, error: { code: 'REFRESH_FAILED', message: 'Failed to refresh token' } };
+    return this.tryRefresh();
   }
 
   // User endpoints
@@ -517,11 +561,17 @@ class ApiClient {
     redirect_uri: string;
     scope?: string;
     state?: string;
+    nonce?: string;
+    max_age?: string;
+    prompt?: string;
     code_challenge?: string;
-  }): Promise<ApiResponse<{ pending: boolean; redirect_url?: string; reused?: boolean }>> {
+  }): Promise<ApiResponse<{ pending?: boolean; redirect_url?: string; reused?: boolean; login_required?: boolean }>> {
     const q = new URLSearchParams({ client_id: params.client_id, redirect_uri: params.redirect_uri });
     if (params.scope) q.set('scope', params.scope);
     if (params.state) q.set('state', params.state);
+    if (params.nonce) q.set('nonce', params.nonce);
+    if (params.max_age) q.set('max_age', params.max_age);
+    if (params.prompt) q.set('prompt', params.prompt);
     if (params.code_challenge) q.set('code_challenge', params.code_challenge);
     return this.request(`/api/oauth/authorize/pending?${q.toString()}`);
   }
@@ -532,6 +582,9 @@ class ApiClient {
     response_type: string;
     scope?: string;
     state?: string;
+    nonce?: string;
+    max_age?: string;
+    prompt?: string;
     code_challenge?: string;
     code_challenge_method?: string;
     consent: 'allow' | 'deny';
@@ -539,6 +592,7 @@ class ApiClient {
     redirect_url: string;
     code?: string;
     state?: string;
+    login_required?: boolean;
     authorization?: {
       scope: string;
       scopes: string[];
@@ -706,6 +760,20 @@ class ApiClient {
     );
   }
 
+  // Risk events endpoint
+  async getRiskEvents(page = 1, limit = 20, decision = '', reason = ''): Promise<ApiResponse<RiskEventsResponse>> {
+    const params = new URLSearchParams({ page: String(page), limit: String(limit) });
+    if (decision) {
+      params.set('decision', decision);
+    }
+    if (reason) {
+      params.set('reason', reason);
+    }
+    return this.request<RiskEventsResponse>(
+      `/api/admin/risk-events?${params.toString()}`
+    );
+  }
+
   // Admin app stats endpoint
   async getAdminAppStats(id: string): Promise<ApiResponse<AppStats>> {
     return this.request<AppStats>(`/api/admin/apps/${id}/stats`);
@@ -828,7 +896,23 @@ class ApiClient {
       issued_token_types?: string[];
     };
   }> {
-    const response = await this.request(
+    const response = await this.request<{
+      user_code: string;
+      scope: string;
+      scopes?: string[];
+      verification_uri?: string;
+      expires_in: number;
+      requested_scopes?: string[];
+      issued_token_types?: string[];
+      app: {
+        id: string;
+        client_id?: string;
+        name: string;
+        description: string;
+        scopes?: string[];
+        issued_token_types?: string[];
+      };
+    }>(
       `/api/oauth/device/info?user_code=${encodeURIComponent(userCode)}`
     );
     if (!response.success || !response.data) {
@@ -850,6 +934,10 @@ class ApiClient {
   /* 联邦登录提供商 API */
   async getFederationProviders(): Promise<ApiResponse<{ providers: FederationProvider[] }>> {
     return this.request<{ providers: FederationProvider[] }>('/api/federation/providers');
+  }
+
+  async getEnterpriseProviders(): Promise<ApiResponse<EnterpriseProvidersResponse>> {
+    return this.request<EnterpriseProvidersResponse>('/api/federation/enterprise/providers');
   }
 
   /* 管理员：获取所有联邦提供商（含禁用的） */
@@ -880,11 +968,71 @@ class ApiClient {
     });
   }
 
+  async getAdminLDAPProviders(): Promise<ApiResponse<{ providers: LDAPProviderConfig[] }>> {
+    return this.request<{ providers: LDAPProviderConfig[] }>('/api/admin/federation/ldap/providers');
+  }
+
+  async createLDAPProvider(data: LDAPProviderUpdateRequest): Promise<ApiResponse<LDAPProviderConfig>> {
+    return this.request<LDAPProviderConfig>('/api/admin/federation/ldap/providers', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async updateLDAPProvider(id: string, data: LDAPProviderUpdateRequest): Promise<ApiResponse<LDAPProviderConfig>> {
+    return this.request<LDAPProviderConfig>(`/api/admin/federation/ldap/providers/${id}`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteLDAPProvider(id: string): Promise<ApiResponse<void>> {
+    return this.request<void>(`/api/admin/federation/ldap/providers/${id}/delete`, {
+      method: 'POST',
+    });
+  }
+
+  async getAdminSAMLProviders(): Promise<ApiResponse<{ providers: SAMLProviderConfig[] }>> {
+    return this.request<{ providers: SAMLProviderConfig[] }>('/api/admin/federation/saml/providers');
+  }
+
+  async createSAMLProvider(data: SAMLProviderUpdateRequest): Promise<ApiResponse<SAMLProviderConfig>> {
+    return this.request<SAMLProviderConfig>('/api/admin/federation/saml/providers', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async updateSAMLProvider(id: string, data: SAMLProviderUpdateRequest): Promise<ApiResponse<SAMLProviderConfig>> {
+    return this.request<SAMLProviderConfig>(`/api/admin/federation/saml/providers/${id}`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteSAMLProvider(id: string): Promise<ApiResponse<void>> {
+    return this.request<void>(`/api/admin/federation/saml/providers/${id}/delete`, {
+      method: 'POST',
+    });
+  }
+
+  async refreshSAMLMetadata(id: string): Promise<ApiResponse<SAMLProviderConfig>> {
+    return this.request<SAMLProviderConfig>(`/api/admin/federation/saml/providers/${id}/refresh-metadata`, {
+      method: 'POST',
+    });
+  }
+
   /* 获取联邦登录URL */
   getFederationLoginUrl(slug: string, returnTo?: string): string {
     const params = new URLSearchParams();
     if (returnTo) params.set('return_to', returnTo);
     return `${API_BASE_URL}/api/federation/login/${slug}?${params.toString()}`;
+  }
+
+  getSAMLLoginUrl(slug: string, returnTo?: string): string {
+    const params = new URLSearchParams();
+    if (returnTo) params.set('return_to', returnTo);
+    return `${API_BASE_URL}/api/federation/saml/${slug}/login?${params.toString()}`;
   }
 
   /* 获取社交登录提供商（/api/auth/social/providers） */

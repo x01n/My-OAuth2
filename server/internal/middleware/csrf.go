@@ -6,7 +6,11 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/url"
-	"strings" 
+	"strings"
+
+	ctx "server/internal/context"
+	"server/internal/model"
+	"server/internal/repository"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,6 +29,14 @@ const (
  * 豁免：OAuth token 端点等外部 API 不需要 CSRF 保护（它们使用 client_secret 鉴权）
  */
 func CSRFProtection() gin.HandlerFunc {
+	return CSRFProtectionWithRiskEventRepository(nil)
+}
+
+/*
+ * CSRFProtectionWithRiskEventRepository 创建带风控事件记录的 CSRF 中间件
+ * @param riskEventRepo - 风控事件仓储，nil 时只拦截不记录
+ */
+func CSRFProtectionWithRiskEventRepository(riskEventRepo *repository.RiskEventRepository) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		/* 只对状态变更请求校验 CSRF */
 		if c.Request.Method == "GET" || c.Request.Method == "HEAD" || c.Request.Method == "OPTIONS" {
@@ -43,44 +55,57 @@ func CSRFProtection() gin.HandlerFunc {
 		 * 确保请求来源的 host 与当前服务 host 一致，阻止跨站伪造
 		 */
 		if !validateOrigin(c) {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"success": false,
-				"error":   gin.H{"code": "CSRF_ORIGIN", "message": "Cross-origin request blocked"},
-			})
+			abortCSRF(c, riskEventRepo, "CSRF_ORIGIN", model.RiskEventReasonCrossOriginRequestBlocked)
 			return
 		}
 
 		/* 从 cookie 读取 csrf_token */
 		cookieToken, err := c.Cookie(CSRFTokenCookie)
 		if err != nil || cookieToken == "" {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"success": false,
-				"error":   gin.H{"code": "CSRF_INVALID", "message": "CSRF token missing"},
-			})
+			abortCSRF(c, riskEventRepo, "CSRF_INVALID", model.RiskEventReasonCSRFTokenMissing)
 			return
 		}
 
 		/* 从请求头读取 csrf_token */
 		headerToken := c.GetHeader(CSRFTokenHeader)
 		if headerToken == "" {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"success": false,
-				"error":   gin.H{"code": "CSRF_INVALID", "message": "CSRF token header missing"},
-			})
+			abortCSRF(c, riskEventRepo, "CSRF_INVALID", model.RiskEventReasonCSRFTokenHeaderMissing)
 			return
 		}
 
 		/* 比对 cookie 和 header 中的 token（使用常量时间比较，防止时序攻击） */
 		if !hmac.Equal([]byte(cookieToken), []byte(headerToken)) {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"success": false,
-				"error":   gin.H{"code": "CSRF_INVALID", "message": "CSRF token mismatch"},
-			})
+			abortCSRF(c, riskEventRepo, "CSRF_INVALID", model.RiskEventReasonCSRFTokenMismatch)
 			return
 		}
 
 		c.Next()
 	}
+}
+
+func abortCSRF(c *gin.Context, riskEventRepo *repository.RiskEventRepository, code, message string) {
+	recordCSRFRiskEvent(c, riskEventRepo, message)
+	c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+		"success": false,
+		"error":   gin.H{"code": code, "message": message},
+	})
+}
+
+func recordCSRFRiskEvent(c *gin.Context, riskEventRepo *repository.RiskEventRepository, reason string) {
+	if riskEventRepo == nil {
+		return
+	}
+	event := &model.RiskEvent{
+		RiskScore: 50,
+		Decision:  model.RiskDecisionChallenge,
+		IPAddress: c.ClientIP(),
+		UserAgent: c.Request.UserAgent(),
+		Reason:    reason,
+	}
+	if currentUserID, ok := ctx.GetUserID(c); ok {
+		event.UserID = &currentUserID
+	}
+	_ = riskEventRepo.Create(event)
 }
 
 /*

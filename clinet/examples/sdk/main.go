@@ -79,15 +79,54 @@ func main() {
 		fmt.Printf("✅ 用户注册成功\n")
 		fmt.Printf("   用户ID: %s\n", registerResp.User.ID)
 		fmt.Printf("   邮箱: %s\n", registerResp.User.Email)
+		fmt.Printf("   Access Token: %s\n", maskToken(registerResp.AccessToken))
+		fmt.Printf("   Refresh Token: %s\n", maskToken(registerResp.RefreshToken))
+		fmt.Printf("   ID Token: %s\n", maskToken(registerResp.IDToken))
 	}
 
 	// ========================================
-	// 示例 3: 验证 Token (使用注册返回的token)
+	// 示例 3: 刷新 SDK 用户 Token
+	// ========================================
+	fmt.Println("\n=== 刷新 SDK 用户 Token 示例 ===")
+
+	var tokenForValidation string
+	if registerResp != nil {
+		refreshResp, err := client.RefreshSDKUserToken(ctx)
+		if err != nil {
+			log.Printf("Token 刷新失败: %v", err)
+			tokenForValidation = registerResp.AccessToken
+		} else {
+			fmt.Printf("✅ Token 刷新成功\n")
+			fmt.Printf("   Access Token: %s\n", maskToken(refreshResp.AccessToken))
+			fmt.Printf("   Refresh Token: %s\n", maskToken(refreshResp.RefreshToken))
+			fmt.Printf("   ID Token: %s\n", maskToken(refreshResp.IDToken))
+			tokenForValidation = refreshResp.AccessToken
+		}
+	}
+
+	// ========================================
+	// 示例 4: 获取有效 SDK 用户 Token
+	// ========================================
+	fmt.Println("\n=== 获取有效 SDK 用户 Token 示例 ===")
+
+	ensuredToken, err := client.EnsureSDKUserToken(ctx)
+	if err != nil {
+		log.Printf("获取有效 Token 失败: %v", err)
+	} else {
+		fmt.Printf("✅ 当前 Token 可用\n")
+		fmt.Printf("   Access Token: %s\n", maskToken(ensuredToken.AccessToken))
+		fmt.Printf("   Refresh Token: %s\n", maskToken(ensuredToken.RefreshToken))
+		fmt.Printf("   ID Token: %s\n", maskToken(ensuredToken.IDToken))
+		tokenForValidation = ensuredToken.AccessToken
+	}
+
+	// ========================================
+	// 示例 5: 验证 Token (使用有效 token)
 	// ========================================
 	fmt.Println("\n=== 验证 Token 示例 ===")
 
-	if registerResp != nil {
-		userInfo, err := client.ValidateUserToken(ctx, registerResp.AccessToken)
+	if tokenForValidation != "" {
+		userInfo, err := client.ValidateUserToken(ctx, tokenForValidation)
 		if err != nil {
 			log.Printf("Token 验证失败: %v", err)
 		} else {
@@ -97,7 +136,7 @@ func main() {
 	}
 
 	// ========================================
-	// 示例 4: 启动 HTTP 服务器处理用户同步
+	// 示例 6: 启动 HTTP 服务器处理用户同步
 	// ========================================
 	fmt.Println("\n=== 启动 HTTP 服务器 ===")
 	fmt.Println("服务器运行在 http://localhost:9002")
@@ -142,4 +181,14 @@ func main() {
 	})
 
 	log.Fatal(http.ListenAndServe(":9002", nil))
+}
+
+func maskToken(token string) string {
+	if token == "" {
+		return ""
+	}
+	if len(token) <= 16 {
+		return token
+	}
+	return token[:16] + "..."
 }

@@ -53,10 +53,29 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
   const responseType = searchParams.get('response_type');
   const scope = searchParams.get('scope') || '';
   const state = searchParams.get('state') || '';
+  const nonce = searchParams.get('nonce') || '';
+  const maxAge = searchParams.get('max_age') || '';
+  const prompt = searchParams.get('prompt') || '';
   const codeChallenge = searchParams.get('code_challenge') || '';
   const codeChallengeMethod = searchParams.get('code_challenge_method') || '';
 
   const returnToAuthorize = `${basePath}?${searchParams.toString()}`;
+  const loginUrl = `/login?return_to=${encodeURIComponent(returnToAuthorize)}`;
+  const forceLoginUrl = `${loginUrl}&force_login=1`;
+  const promptNone = prompt.split(/\s+/).includes('none');
+
+  const buildAuthorizeErrorRedirect = useCallback((errorCode: string, errorDescription: string) => {
+    if (!redirectUri) return null;
+    try {
+      const url = new URL(redirectUri);
+      url.searchParams.set('error', errorCode);
+      url.searchParams.set('error_description', errorDescription);
+      if (state) url.searchParams.set('state', state);
+      return url.toString();
+    } catch {
+      return null;
+    }
+  }, [redirectUri, state]);
 
   /** 从后端拉取授权上下文（公开接口，不依赖是否已登录） */
   const fetchAuthorizeContext = useCallback(async () => {
@@ -113,14 +132,28 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
       redirect_uri: redirectUri,
       scope: scope || undefined,
       state: state || undefined,
+      nonce: nonce || undefined,
+      max_age: maxAge || undefined,
+      prompt: prompt || undefined,
       code_challenge: codeChallenge || undefined,
     });
+
+    if (pending.success && pending.data?.redirect_url && !pending.data.pending) {
+      consentSubmittedRef.current = true;
+      setRedirectUrl(pending.data.redirect_url);
+      return;
+    }
+
+    if (pending.success && pending.data?.login_required) {
+      router.replace(forceLoginUrl);
+      return;
+    }
 
     if (pending.success && pending.data?.pending && pending.data.redirect_url) {
       consentSubmittedRef.current = true;
       setRedirectUrl(pending.data.redirect_url);
     }
-  }, [clientId, redirectUri, scope, state, codeChallenge]);
+  }, [clientId, redirectUri, scope, state, nonce, maxAge, prompt, codeChallenge, router, forceLoginUrl]);
 
   useEffect(() => {
     void fetchAuthorizeContext();
@@ -130,12 +163,20 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
     if (authLoading || !appInfoReady || consentSubmittedRef.current) return;
 
     if (!isAuthenticated) {
-      router.replace(`/login?return_to=${encodeURIComponent(returnToAuthorize)}`);
+      if (promptNone) {
+        const errorRedirect = buildAuthorizeErrorRedirect('login_required', 'End-user authentication is required');
+        if (errorRedirect) {
+          consentSubmittedRef.current = true;
+          setRedirectUrl(errorRedirect);
+          return;
+        }
+      }
+      router.replace(loginUrl);
       return;
     }
 
     void checkPendingRedirect();
-  }, [authLoading, isAuthenticated, appInfoReady, router, returnToAuthorize, checkPendingRedirect]);
+  }, [authLoading, isAuthenticated, appInfoReady, router, loginUrl, promptNone, buildAuthorizeErrorRedirect, checkPendingRedirect]);
 
   useEffect(() => {
     if (redirectUrl) {
@@ -148,7 +189,15 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
     if (consentSubmittedRef.current || isSubmitting) return;
 
     if (!isAuthenticated) {
-      router.push(`/login?return_to=${encodeURIComponent(returnToAuthorize)}`);
+      if (promptNone) {
+        const errorRedirect = buildAuthorizeErrorRedirect('login_required', 'End-user authentication is required');
+        if (errorRedirect) {
+          consentSubmittedRef.current = true;
+          setRedirectUrl(errorRedirect);
+          return;
+        }
+      }
+      router.push(loginUrl);
       return;
     }
 
@@ -161,10 +210,24 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
         response_type: responseType,
         scope: scope || undefined,
         state: state || undefined,
+        nonce: nonce || undefined,
+        max_age: maxAge || undefined,
+        prompt: prompt || undefined,
         code_challenge: codeChallenge || undefined,
         code_challenge_method: codeChallengeMethod || undefined,
         consent: allow ? 'allow' : 'deny',
       });
+
+      if (response.success && response.data?.redirect_url && !response.data.code) {
+        consentSubmittedRef.current = true;
+        setRedirectUrl(response.data.redirect_url);
+        return;
+      }
+
+      if (response.success && response.data?.login_required) {
+        router.push(forceLoginUrl);
+        return;
+      }
 
       if (response.success && response.data?.redirect_url) {
         consentSubmittedRef.current = true;
@@ -280,7 +343,7 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
 
           <div className="text-xs text-muted-foreground bg-slate-100 dark:bg-slate-800 p-3 rounded-md">
             <p>{t('oauth.authorize.redirectTo')}</p>
-            <p className="font-mono truncate mt-1">{redirectUri}</p>
+            <p className="font-mono break-all mt-1">{redirectUri}</p>
           </div>
         </CardContent>
         <CardFooter className="flex gap-3">
@@ -288,7 +351,7 @@ function AuthorizeContent({ basePath }: { basePath: string }) {
             variant="outline"
             className="flex-1"
             onClick={() => handleConsent(false)}
-            disabled={isSubmitting || !!redirectUrl || invalidScopes.length > 0}
+            disabled={isSubmitting || !!redirectUrl}
           >
             <X className="mr-2 h-4 w-4" />
             {t('oauth.authorize.deny')}

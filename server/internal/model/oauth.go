@@ -21,6 +21,10 @@ type AuthorizationCode struct {
 	UserID              uuid.UUID `gorm:"type:uuid;index" json:"user_id"`
 	RedirectURI         string    `gorm:"size:500;not null" json:"redirect_uri"`
 	Scope               string    `gorm:"size:500" json:"scope"`
+	Nonce               string    `gorm:"size:255" json:"nonce,omitempty"`
+	AuthTime            int64     `json:"auth_time,omitempty"`
+	AMR                 string    `gorm:"size:255" json:"amr,omitempty"`
+	MaxAge              int64     `json:"max_age,omitempty"`
 	CodeChallenge       string    `gorm:"size:128" json:"code_challenge,omitempty"`
 	CodeChallengeMethod string    `gorm:"size:10" json:"code_challenge_method,omitempty"`
 	ExpiresAt           time.Time `gorm:"not null" json:"expires_at"`
@@ -70,6 +74,8 @@ type AccessToken struct {
 	ClientID  string     `gorm:"size:100;not null;index:idx_at_client_user,priority:1" json:"client_id"`
 	UserID    *uuid.UUID `gorm:"type:uuid;index:idx_at_client_user,priority:2" json:"user_id"`
 	Scope     string     `gorm:"size:500" json:"scope"`
+	AuthTime  int64      `json:"auth_time,omitempty"`
+	AMR       string     `gorm:"size:255" json:"amr,omitempty"`
 	ExpiresAt time.Time  `gorm:"not null;index:idx_at_expires" json:"expires_at"`
 	Revoked   bool       `gorm:"default:false;index:idx_at_revoked_expires" json:"revoked"`
 	CreatedAt time.Time  `gorm:"autoCreateTime" json:"created_at"`

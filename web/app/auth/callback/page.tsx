@@ -4,6 +4,8 @@ import { useEffect, useState, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useAuth } from '@/lib/auth-context';
 import { useI18n } from '@/lib/i18n';
+import { api } from '@/lib/api';
+import { safeReturnPath } from '@/lib/redirect';
 import { Loader2, CheckCircle, AlertCircle } from 'lucide-react';
 
 function CallbackHandler() {
@@ -17,8 +19,7 @@ function CallbackHandler() {
   useEffect(() => {
     const handleCallback = async () => {
       const accessToken = searchParams.get('access_token');
-      const refreshToken = searchParams.get('refresh_token');
-      const returnTo = searchParams.get('return_to') || '/dashboard';
+      const returnTo = safeReturnPath(searchParams.get('return_to'));
       const error = searchParams.get('error');
 
       if (error) {
@@ -30,33 +31,25 @@ function CallbackHandler() {
         return;
       }
 
-      if (!accessToken || !refreshToken) {
-        setStatus('error');
-        setMessage(t('auth.callback.missingTokens'));
-        setTimeout(() => {
-          router.push('/login');
-        }, 3000);
-        return;
-      }
-
       try {
-        // Store tokens
-        localStorage.setItem('access_token', accessToken);
-        localStorage.setItem('refresh_token', refreshToken);
+        if (accessToken) api.setAccessToken(accessToken);
 
-        // Refresh user info
-        await refreshUser();
+        const refreshed = await refreshUser();
+        if (!refreshed) {
+          setStatus('error');
+          setMessage(t('auth.callback.missingTokens'));
+          setTimeout(() => {
+            router.push('/login');
+          }, 3000);
+          return;
+        }
 
         setStatus('success');
         setMessage(t('auth.callback.success'));
 
         // Redirect to return URL
         setTimeout(() => {
-          if (returnTo.startsWith('http://') || returnTo.startsWith('https://')) {
-            window.location.href = returnTo;
-          } else {
-            router.push(returnTo);
-          }
+          router.push(returnTo);
         }, 1000);
       } catch (err) {
         console.error('Callback error:', err);

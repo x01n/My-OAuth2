@@ -25,12 +25,13 @@ import (
  * 功能：处理用户管理、应用管理、登录日志、授权统计、系统概览等管理员 HTTP 请求
  */
 type AdminHandler struct {
-	userRepo     *repository.UserRepository
-	appRepo      *repository.ApplicationRepository
-	loginLogRepo *repository.LoginLogRepository
-	userAuthRepo *repository.UserAuthorizationRepository
-	resetService *service.PasswordResetService
-	emailService *email.Service
+	userRepo      *repository.UserRepository
+	appRepo       *repository.ApplicationRepository
+	loginLogRepo  *repository.LoginLogRepository
+	riskEventRepo *repository.RiskEventRepository
+	userAuthRepo  *repository.UserAuthorizationRepository
+	resetService  *service.PasswordResetService
+	emailService  *email.Service
 }
 
 /*
@@ -38,19 +39,22 @@ type AdminHandler struct {
  * @param userRepo     - 用户仓储
  * @param appRepo      - 应用仓储
  * @param loginLogRepo - 登录日志仓储
+ * @param riskEventRepo - 风控事件仓储
  * @param userAuthRepo - 用户授权仓储
  */
 func NewAdminHandler(
 	userRepo *repository.UserRepository,
 	appRepo *repository.ApplicationRepository,
 	loginLogRepo *repository.LoginLogRepository,
+	riskEventRepo *repository.RiskEventRepository,
 	userAuthRepo *repository.UserAuthorizationRepository,
 ) *AdminHandler {
 	return &AdminHandler{
-		userRepo:     userRepo,
-		appRepo:      appRepo,
-		loginLogRepo: loginLogRepo,
-		userAuthRepo: userAuthRepo,
+		userRepo:      userRepo,
+		appRepo:       appRepo,
+		loginLogRepo:  loginLogRepo,
+		riskEventRepo: riskEventRepo,
+		userAuthRepo:  userAuthRepo,
 	}
 }
 
@@ -85,6 +89,57 @@ type UserListItem struct {
 	LastLoginAt      *string `json:"last_login_at,omitempty"`
 	CreatedAt        string  `json:"created_at"`
 	UpdatedAt        string  `json:"updated_at"`
+}
+
+// RiskEventUserSummary is the minimal user shape returned with risk events.
+type RiskEventUserSummary struct {
+	ID       string `json:"id"`
+	Email    string `json:"email"`
+	Username string `json:"username"`
+	Avatar   string `json:"avatar,omitempty"`
+	Status   string `json:"status"`
+}
+
+// RiskEventResponse avoids serializing the full User model in risk logs.
+type RiskEventResponse struct {
+	ID        string                `json:"id"`
+	UserID    *uuid.UUID            `json:"user_id,omitempty"`
+	RiskScore int                   `json:"risk_score"`
+	Decision  model.RiskDecision    `json:"decision"`
+	IPAddress string                `json:"ip_address,omitempty"`
+	UserAgent string                `json:"user_agent,omitempty"`
+	Reason    string                `json:"reason,omitempty"`
+	CreatedAt time.Time             `json:"created_at"`
+	User      *RiskEventUserSummary `json:"user,omitempty"`
+}
+
+// LoginLogUserSummary is the minimal user shape returned with login logs.
+type LoginLogUserSummary struct {
+	ID       string `json:"id"`
+	Email    string `json:"email"`
+	Username string `json:"username"`
+}
+
+// LoginLogAppSummary is the minimal application shape returned with login logs.
+type LoginLogAppSummary struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// LoginLogResponse avoids serializing full relation models in login logs.
+type LoginLogResponse struct {
+	ID            string               `json:"id"`
+	UserID        *uuid.UUID           `json:"user_id,omitempty"`
+	AppID         *uuid.UUID           `json:"app_id,omitempty"`
+	LoginType     model.LoginType      `json:"login_type"`
+	IPAddress     string               `json:"ip_address"`
+	UserAgent     string               `json:"user_agent"`
+	Success       bool                 `json:"success"`
+	FailureReason string               `json:"failure_reason,omitempty"`
+	Email         string               `json:"email,omitempty"`
+	CreatedAt     time.Time            `json:"created_at"`
+	User          *LoginLogUserSummary `json:"user,omitempty"`
+	App           *LoginLogAppSummary  `json:"app,omitempty"`
 }
 
 /**
@@ -414,11 +469,116 @@ func (h *AdminHandler) GetLoginLogs(c *gin.Context) {
 		return
 	}
 
+	responses := make([]LoginLogResponse, len(logs))
+	for i, log := range logs {
+		responses[i] = LoginLogResponse{
+			ID:            log.ID.String(),
+			UserID:        log.UserID,
+			AppID:         log.AppID,
+			LoginType:     log.LoginType,
+			IPAddress:     log.IPAddress,
+			UserAgent:     log.UserAgent,
+			Success:       log.Success,
+			FailureReason: log.FailureReason,
+			Email:         log.Email,
+			CreatedAt:     log.CreatedAt,
+		}
+		if log.User != nil {
+			responses[i].User = &LoginLogUserSummary{
+				ID:       log.User.ID.String(),
+				Email:    log.User.Email,
+				Username: log.User.Username,
+			}
+		}
+		if log.App != nil {
+			responses[i].App = &LoginLogAppSummary{
+				ID:   log.App.ID.String(),
+				Name: log.App.Name,
+			}
+		}
+	}
+
 	Success(c, gin.H{
-		"logs":  logs,
+		"logs":  responses,
 		"total": total,
 		"page":  page,
 		"limit": limit,
+	})
+}
+
+// GetRiskEvents returns recent risk events (admin only)
+// GET /api/admin/risk-events
+func (h *AdminHandler) GetRiskEvents(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	decision := c.Query("decision")
+	reason := c.Query("reason")
+
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+
+	offset := (page - 1) * limit
+	var events []model.RiskEvent
+	var total int64
+	var err error
+
+	filter := repository.RiskEventFilter{Reason: reason}
+	if decision != "" {
+		switch model.RiskDecision(decision) {
+		case model.RiskDecisionPass, model.RiskDecisionChallenge, model.RiskDecisionMFA, model.RiskDecisionBlock:
+			parsedDecision := model.RiskDecision(decision)
+			filter.Decision = &parsedDecision
+		default:
+			BadRequest(c, "Invalid risk decision")
+			return
+		}
+	}
+	if reason != "" && !model.IsRiskEventReason(reason) {
+		BadRequest(c, "Invalid risk reason")
+		return
+	}
+
+	events, total, err = h.riskEventRepo.FindRecentFiltered(filter, offset, limit)
+	if err != nil {
+		InternalError(c, "Failed to fetch risk events")
+		return
+	}
+
+	responses := make([]RiskEventResponse, len(events))
+	for i, event := range events {
+		responses[i] = RiskEventResponse{
+			ID:        event.ID.String(),
+			UserID:    event.UserID,
+			RiskScore: event.RiskScore,
+			Decision:  event.Decision,
+			IPAddress: event.IPAddress,
+			UserAgent: event.UserAgent,
+			Reason:    event.Reason,
+			CreatedAt: event.CreatedAt,
+		}
+		if event.User != nil {
+			responses[i].User = &RiskEventUserSummary{
+				ID:       event.User.ID.String(),
+				Email:    event.User.Email,
+				Username: event.User.Username,
+				Avatar:   event.User.Avatar,
+				Status:   event.User.Status,
+			}
+		}
+	}
+
+	Success(c, gin.H{
+		"events":   responses,
+		"total":    total,
+		"page":     page,
+		"limit":    limit,
+		"decision": decision,
+		"reason":   reason,
+		"reasons":  model.RiskEventReasons(),
 	})
 }
 

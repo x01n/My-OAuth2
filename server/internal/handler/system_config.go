@@ -33,7 +33,7 @@ type SystemConfigResponse struct {
 	JWT      JWTConfigSafe       `json:"jwt"`
 	OAuth    config.OAuthConfig  `json:"oauth"`
 	Email    EmailConfigSafe     `json:"email"`
-	Social   config.SocialConfig `json:"social"`
+	Social   SocialConfigSafe    `json:"social"`
 }
 
 /* DatabaseConfigSafe 安全的数据库配置结构（隐藏 DSN 敏感细节） */
@@ -65,6 +65,20 @@ type EmailConfigSafe struct {
 	UseTLS      bool   `json:"use_tls"`
 }
 
+/* SocialProviderConfigSafe 安全的社交登录提供者配置（隐藏密钥，仅暴露是否已配置） */
+type SocialProviderConfigSafe struct {
+	Enabled                bool   `json:"enabled"`
+	ClientID               string `json:"client_id"`
+	ClientSecretConfigured bool   `json:"client_secret_configured"`
+}
+
+/* SocialConfigSafe 安全的社交登录配置 */
+type SocialConfigSafe struct {
+	Enabled bool                     `json:"enabled"`
+	GitHub  SocialProviderConfigSafe `json:"github"`
+	Google  SocialProviderConfigSafe `json:"google"`
+}
+
 // GetConfig 获取系统配置
 // GET /api/admin/system/config
 func (h *SystemConfigHandler) GetConfig(c *gin.Context) {
@@ -72,7 +86,7 @@ func (h *SystemConfigHandler) GetConfig(c *gin.Context) {
 		Server: h.cfg.Server,
 		Database: DatabaseConfigSafe{
 			Driver:             h.cfg.Database.Driver,
-			DSN:                h.cfg.Database.DSN,
+			DSN:                config.RedactConfigDSN(h.cfg.Database.Driver, h.cfg.Database.DSN),
 			MaxOpenConns:       h.cfg.Database.MaxOpenConns,
 			MaxIdleConns:       h.cfg.Database.MaxIdleConns,
 			ConnMaxLifetimeMin: h.cfg.Database.ConnMaxLifetimeMin,
@@ -94,7 +108,19 @@ func (h *SystemConfigHandler) GetConfig(c *gin.Context) {
 			FromName:    h.cfg.Email.FromName,
 			UseTLS:      h.cfg.Email.UseTLS,
 		},
-		Social: h.cfg.Social,
+		Social: SocialConfigSafe{
+			Enabled: h.cfg.Social.Enabled,
+			GitHub: SocialProviderConfigSafe{
+				Enabled:                h.cfg.Social.GitHub.Enabled,
+				ClientID:               h.cfg.Social.GitHub.ClientID,
+				ClientSecretConfigured: h.cfg.Social.GitHub.ClientSecret != "",
+			},
+			Google: SocialProviderConfigSafe{
+				Enabled:                h.cfg.Social.Google.Enabled,
+				ClientID:               h.cfg.Social.Google.ClientID,
+				ClientSecretConfigured: h.cfg.Social.Google.ClientSecret != "",
+			},
+		},
 	}
 
 	c.JSON(http.StatusOK, Response{

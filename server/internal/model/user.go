@@ -30,7 +30,7 @@ const (
  * User 用户模型
  * 功能：OAuth2 认证系统的核心用户实体，兼容 OIDC 标准声明（Standard Claims）
  * 表名：users
- * 索引：email(唯一), username(唯一), external_id
+ * 索引：email(唯一), username(唯一), external_id, (external_source, external_id)
  */
 type User struct {
 	ID            uuid.UUID `gorm:"type:uuid;primaryKey" json:"id"`
@@ -77,8 +77,8 @@ type User struct {
 	LockedUntil  *time.Time `json:"-"`
 
 	// External Identity
-	ExternalID     string `gorm:"size:255;index" json:"external_id,omitempty"` // 外部系统ID
-	ExternalSource string `gorm:"size:50" json:"external_source,omitempty"`    // 来源系统
+	ExternalID     string `gorm:"size:255;index;index:idx_users_external_source_id,priority:2" json:"external_id,omitempty"` // 外部系统ID
+	ExternalSource string `gorm:"size:50;index:idx_users_external_source_id,priority:1" json:"external_source,omitempty"`    // 来源系统
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`

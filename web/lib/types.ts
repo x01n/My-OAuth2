@@ -10,7 +10,7 @@ export interface AddressInfo {
   country?: string;
 }
 
-export type UserStatus = 'active' | 'suspended' | 'pending';
+export type UserStatus = 'active' | 'disabled' | 'suspended' | 'pending';
 
 export interface User {
   id: string;
@@ -98,12 +98,19 @@ export interface AdminUpdateUserRequest {
 export interface AuthTokens {
   access_token: string;
   refresh_token: string;
+  id_token?: string;
   token_type: string;
   expires_in: number;
 }
 
 export interface LoginRequest {
   email: string;
+  password: string;
+}
+
+export interface LDAPLoginRequest {
+  provider_slug: string;
+  identifier: string;
   password: string;
 }
 
@@ -116,6 +123,11 @@ export interface RegisterRequest {
 export interface LoginResponse {
   user: User;
   tokens: AuthTokens;
+  access_token: string;
+  refresh_token: string;
+  id_token?: string;
+  token_type: string;
+  expires_in: number;
 }
 
 // Application types
@@ -166,6 +178,9 @@ export interface AuthorizeRequest {
   redirect_uri: string;
   scope?: string;
   state?: string;
+  nonce?: string;
+  max_age?: string;
+  prompt?: string;
   code_challenge?: string;
   code_challenge_method?: string;
 }
@@ -223,15 +238,50 @@ export interface LoginLog {
   id: string;
   user_id?: string;
   app_id?: string;
-  login_type: 'direct' | 'oauth' | 'sdk';
+  login_type: 'direct' | 'oauth' | 'sdk' | 'ldap' | 'saml';
   ip_address: string;
   user_agent: string;
   success: boolean;
   failure_reason?: string;
   email?: string;
   created_at: string;
-  user?: User;
-  app?: Application;
+  user?: {
+    id: string;
+    email: string;
+    username: string;
+  };
+  app?: {
+    id: string;
+    name: string;
+  };
+}
+
+export interface RiskEvent {
+  id: string;
+  user_id?: string;
+  risk_score: number;
+  decision: 'pass' | 'challenge' | 'mfa' | 'block';
+  ip_address?: string;
+  user_agent?: string;
+  reason?: string;
+  created_at: string;
+  user?: {
+    id: string;
+    email: string;
+    username: string;
+    avatar?: string;
+    status: string;
+  };
+}
+
+export interface RiskEventsResponse {
+  events: RiskEvent[];
+  total: number;
+  page: number;
+  limit: number;
+  decision: string;
+  reason: string;
+  reasons: string[];
 }
 
 export interface AppStats {
@@ -368,6 +418,154 @@ export interface CreateFederationProviderRequest {
   button_text?: string;
 }
 
+export interface EnterpriseProviderPublic {
+  slug: string;
+  name: string;
+  description?: string;
+  icon_url?: string;
+  button_text?: string;
+}
+
+export interface EnterpriseProvidersResponse {
+  ldap_providers: EnterpriseProviderPublic[];
+  saml_providers: EnterpriseProviderPublic[];
+}
+
+export interface LDAPProviderConfig {
+  id: string;
+  name: string;
+  slug: string;
+  description?: string;
+  ldap_url: string;
+  use_starttls: boolean;
+  insecure_skip_verify: boolean;
+  bind_dn?: string;
+  bind_password_configured: boolean;
+  base_dn: string;
+  user_filter?: string;
+  external_id_attr?: string;
+  principal_attr?: string;
+  email_attr?: string;
+  username_attr?: string;
+  employee_id_attr?: string;
+  display_name_attr?: string;
+  given_name_attr?: string;
+  family_name_attr?: string;
+  group_attr?: string;
+  role_mappings?: Record<string, string>;
+  default_role: UserRole;
+  enabled: boolean;
+  auto_create_user: boolean;
+  trust_email_verified: boolean;
+  sync_profile: boolean;
+  sync_enabled: boolean;
+  sync_interval_min: number;
+  sync_page_size: number;
+  last_sync_at?: string;
+  last_sync_status?: string;
+  icon_url?: string;
+  button_text?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LDAPProviderUpdateRequest {
+  name?: string;
+  slug?: string;
+  description?: string;
+  ldap_url?: string;
+  use_starttls?: boolean;
+  insecure_skip_verify?: boolean;
+  bind_dn?: string;
+  bind_password?: string;
+  base_dn?: string;
+  user_filter?: string;
+  external_id_attr?: string;
+  principal_attr?: string;
+  email_attr?: string;
+  username_attr?: string;
+  employee_id_attr?: string;
+  display_name_attr?: string;
+  given_name_attr?: string;
+  family_name_attr?: string;
+  group_attr?: string;
+  role_mappings?: Record<string, string>;
+  default_role?: UserRole;
+  enabled?: boolean;
+  auto_create_user?: boolean;
+  trust_email_verified?: boolean;
+  sync_profile?: boolean;
+  sync_enabled?: boolean;
+  sync_interval_min?: number;
+  sync_page_size?: number;
+  icon_url?: string;
+  button_text?: string;
+}
+
+export interface SAMLProviderConfig {
+  id: string;
+  name: string;
+  slug: string;
+  description?: string;
+  metadata_url?: string;
+  metadata_xml_configured: boolean;
+  sp_entity_id?: string;
+  certificate_configured: boolean;
+  private_key_configured: boolean;
+  sign_requests: boolean;
+  allow_idp_initiated: boolean;
+  default_redirect_path?: string;
+  name_id_format?: string;
+  email_attribute?: string;
+  username_attribute?: string;
+  employee_id_attribute?: string;
+  display_name_attribute?: string;
+  given_name_attribute?: string;
+  family_name_attribute?: string;
+  group_attribute?: string;
+  role_mappings?: Record<string, string>;
+  default_role: UserRole;
+  enabled: boolean;
+  auto_create_user: boolean;
+  trust_email_verified: boolean;
+  sync_profile: boolean;
+  metadata_fetched_at?: string;
+  icon_url?: string;
+  button_text?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SAMLProviderUpdateRequest {
+  name?: string;
+  slug?: string;
+  description?: string;
+  metadata_url?: string;
+  metadata_xml?: string;
+  sp_entity_id?: string;
+  certificate_pem?: string;
+  private_key_pem?: string;
+  sign_requests?: boolean;
+  allow_idp_initiated?: boolean;
+  default_redirect_path?: string;
+  name_id_format?: string;
+  email_attribute?: string;
+  username_attribute?: string;
+  employee_id_attribute?: string;
+  display_name_attribute?: string;
+  given_name_attribute?: string;
+  family_name_attribute?: string;
+  group_attribute?: string;
+  role_mappings?: Record<string, string>;
+  default_role?: UserRole;
+  enabled?: boolean;
+  auto_create_user?: boolean;
+  trust_email_verified?: boolean;
+  sync_profile?: boolean;
+  icon_url?: string;
+  button_text?: string;
+}
+
 export interface SocialProvider {
   slug: string;
   name: string;
@@ -419,12 +617,12 @@ export interface SystemConfig {
     github: {
       enabled: boolean;
       client_id: string;
-      client_secret: string;
+      client_secret_configured: boolean;
     };
     google: {
       enabled: boolean;
       client_id: string;
-      client_secret: string;
+      client_secret_configured: boolean;
     };
   };
 }

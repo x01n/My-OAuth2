@@ -1,10 +1,17 @@
 package repository
 
 import (
+	"errors"
+	"time"
+
 	"server/internal/model"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+)
+
+var (
+	ErrFederatedIdentityAlreadyExists = errors.New("federated identity already exists")
 )
 
 /*
@@ -55,7 +62,58 @@ func (r *FederationRepository) FindBySlug(slug string) (*model.FederatedProvider
 
 /* CreateProvider 创建新的联邦提供者 */
 func (r *FederationRepository) CreateProvider(provider *model.FederatedProvider) error {
-	return r.db.Create(provider).Error
+	if provider.ID == uuid.Nil {
+		provider.ID = uuid.New()
+	}
+	now := time.Now().UTC()
+	if provider.CreatedAt.IsZero() {
+		provider.CreatedAt = now
+	}
+	provider.UpdatedAt = now
+
+	type federatedProviderInsert struct {
+		ID                 uuid.UUID
+		Name               string
+		Slug               string
+		Description        string
+		AuthURL            string
+		TokenURL           string
+		UserInfoURL        string
+		ClientID           string
+		ClientSecret       string
+		Scopes             string
+		Enabled            bool
+		AutoCreateUser     bool
+		TrustEmailVerified bool
+		SyncProfile        bool
+		IconURL            string
+		ButtonText         string
+		CreatedAt          time.Time
+		UpdatedAt          time.Time
+	}
+
+	row := federatedProviderInsert{
+		ID:                 provider.ID,
+		Name:               provider.Name,
+		Slug:               provider.Slug,
+		Description:        provider.Description,
+		AuthURL:            provider.AuthURL,
+		TokenURL:           provider.TokenURL,
+		UserInfoURL:        provider.UserInfoURL,
+		ClientID:           provider.ClientID,
+		ClientSecret:       provider.ClientSecret,
+		Scopes:             provider.Scopes,
+		Enabled:            provider.Enabled,
+		AutoCreateUser:     provider.AutoCreateUser,
+		TrustEmailVerified: provider.TrustEmailVerified,
+		SyncProfile:        provider.SyncProfile,
+		IconURL:            provider.IconURL,
+		ButtonText:         provider.ButtonText,
+		CreatedAt:          provider.CreatedAt,
+		UpdatedAt:          provider.UpdatedAt,
+	}
+
+	return r.db.Table(provider.TableName()).Create(&row).Error
 }
 
 /* UpdateProvider 更新联邦提供者 */
@@ -82,6 +140,17 @@ func (r *FederationRepository) FindIdentityByExternalID(providerID uuid.UUID, ex
 }
 
 /*
+ * FindIdentityByUserAndProvider 查找用户在指定提供者下的身份关联
+ * @param userID - 用户 UUID
+ * @param providerID - 提供者 UUID
+ */
+func (r *FederationRepository) FindIdentityByUserAndProvider(userID, providerID uuid.UUID) (*model.FederatedIdentity, error) {
+	var identity model.FederatedIdentity
+	err := r.db.First(&identity, "user_id = ? AND provider_id = ?", userID, providerID).Error
+	return &identity, err
+}
+
+/*
  * FindIdentitiesByUserID 查找用户的所有联邦身份关联（预加载提供者）
  * @param userID - 用户 UUID
  */
@@ -93,7 +162,14 @@ func (r *FederationRepository) FindIdentitiesByUserID(userID uuid.UUID) ([]model
 
 /* CreateIdentity 创建新的身份关联 */
 func (r *FederationRepository) CreateIdentity(identity *model.FederatedIdentity) error {
-	return r.db.Create(identity).Error
+	result := r.db.Create(identity)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrDuplicatedKey) {
+			return ErrFederatedIdentityAlreadyExists
+		}
+		return result.Error
+	}
+	return nil
 }
 
 /* UpdateIdentity 更新身份关联 */

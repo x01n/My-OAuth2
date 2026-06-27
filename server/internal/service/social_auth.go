@@ -29,6 +29,7 @@ var (
 	ErrOAuthUserInfo         = errors.New("failed to get user info from provider")
 	ErrNoEmailFromProvider   = errors.New("no email returned from provider")
 	ErrIdentityAlreadyLinked = errors.New("this social account is already linked to another user")
+	ErrProviderAlreadyLinked = errors.New("this provider is already linked to current user")
 	ErrIdentityNotFound      = errors.New("social identity not found")
 	ErrCannotUnlinkOnly      = errors.New("cannot unlink the only login method")
 )
@@ -146,6 +147,9 @@ func (s *SocialAuthService) ExchangeCodeForToken(ctx context.Context, providerSl
 	if err != nil {
 		return nil, ErrProviderNotFound
 	}
+	if !provider.Enabled {
+		return nil, ErrProviderDisabled
+	}
 
 	data := url.Values{}
 	data.Set("client_id", provider.ClientID)
@@ -208,6 +212,9 @@ func (s *SocialAuthService) GetUserInfo(ctx context.Context, providerSlug, acces
 	provider, err := s.federationRepo.FindBySlug(providerSlug)
 	if err != nil {
 		return nil, ErrProviderNotFound
+	}
+	if !provider.Enabled {
+		return nil, ErrProviderDisabled
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", provider.UserInfoURL, nil)
@@ -394,6 +401,9 @@ func (s *SocialAuthService) LoginOrCreateUser(
 	if err != nil {
 		return nil, nil, ErrProviderNotFound
 	}
+	if !provider.Enabled {
+		return nil, nil, ErrProviderDisabled
+	}
 
 	// 查找是否已有关联身份
 	identity, err := s.federationRepo.FindIdentityByExternalID(provider.ID, userInfo.ID)
@@ -559,38 +569,54 @@ func (s *SocialAuthService) ensureUniqueUsername(base string) string {
 }
 
 func (s *SocialAuthService) generateTokens(user *model.User) (*AuthTokens, error) {
-	accessToken, err := s.jwtManager.GenerateToken(
+	authTime := time.Now().Unix()
+	accessToken, err := s.jwtManager.GenerateTokenWithAuthTime(
 		user.ID,
 		user.Email,
 		user.Username,
 		string(user.Role),
 		jwt.TokenTypeAccess,
+		authTime,
 		s.config.JWT.AccessTokenTTL,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	refreshToken, err := s.jwtManager.GenerateToken(
+	refreshToken, err := s.jwtManager.GenerateTokenWithAuthTime(
 		user.ID,
 		user.Email,
 		user.Username,
 		string(user.Role),
 		jwt.TokenTypeRefresh,
+		authTime,
 		s.config.JWT.RefreshTokenTTL,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	/* 将 refresh token 的 JTI 存入 DB，用于 Token Rotation 追踪 */
+	/* 将本地 token 写入 DB，用于后续 revoke/rotation 追踪 */
 	if s.oauthRepo != nil {
-		if refreshClaims, parseErr := s.jwtManager.ValidateRefreshToken(refreshToken); parseErr == nil {
-			_ = s.oauthRepo.StoreAuthRefreshToken(
-				refreshClaims.ID,
-				user.ID,
-				refreshClaims.ExpiresAt.Time,
-			)
+		if storeErr := s.oauthRepo.CreateAccessToken(&model.AccessToken{
+			Token:     accessToken,
+			ClientID:  "",
+			UserID:    &user.ID,
+			Scope:     "openid profile email",
+			ExpiresAt: time.Now().Add(s.config.JWT.AccessTokenTTL),
+		}); storeErr != nil {
+			return nil, fmt.Errorf("failed to persist access token: %w", storeErr)
+		}
+		refreshClaims, parseErr := s.jwtManager.ValidateRefreshToken(refreshToken)
+		if parseErr != nil {
+			return nil, fmt.Errorf("failed to validate refresh token for persistence: %w", parseErr)
+		}
+		if storeErr := s.oauthRepo.StoreAuthRefreshToken(
+			refreshClaims.ID,
+			user.ID,
+			refreshClaims.ExpiresAt.Time,
+		); storeErr != nil {
+			return nil, fmt.Errorf("failed to persist refresh token: %w", storeErr)
 		}
 	}
 
@@ -599,8 +625,8 @@ func (s *SocialAuthService) generateTokens(user *model.User) (*AuthTokens, error
 	if idTTL <= 0 {
 		idTTL = s.config.JWT.AccessTokenTTL
 	}
-	idToken, err := s.jwtManager.GenerateIDToken(
-		user.ID, user.Email, user.Username, string(user.Role), "", loginScope, idTTL,
+	idToken, err := s.jwtManager.GenerateIDTokenWithNonceAndAuthTime(
+		user.ID, user.Email, user.Username, string(user.Role), "", loginScope, "", authTime, idTTL,
 	)
 	if err != nil {
 		return nil, err
@@ -663,6 +689,11 @@ func (s *SocialAuthService) LinkAccount(
 		return s.federationRepo.UpdateIdentity(existingIdentity)
 	}
 
+	currentUserIdentity, err := s.federationRepo.FindIdentityByUserAndProvider(userID, provider.ID)
+	if err == nil && currentUserIdentity != nil {
+		return ErrProviderAlreadyLinked
+	}
+
 	// 创建新关联
 	identity := &model.FederatedIdentity{
 		UserID:        userID,
@@ -676,7 +707,16 @@ func (s *SocialAuthService) LinkAccount(
 		identity.TokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 	}
 
-	return s.federationRepo.CreateIdentity(identity)
+	if err := s.federationRepo.CreateIdentity(identity); err != nil {
+		if errors.Is(err, repository.ErrFederatedIdentityAlreadyExists) {
+			if existingIdentity, findErr := s.federationRepo.FindIdentityByExternalID(provider.ID, userInfo.ID); findErr == nil && existingIdentity != nil && existingIdentity.UserID != userID {
+				return ErrIdentityAlreadyLinked
+			}
+			return ErrProviderAlreadyLinked
+		}
+		return err
+	}
+	return nil
 }
 
 // UnlinkAccount 解除社交账号关联

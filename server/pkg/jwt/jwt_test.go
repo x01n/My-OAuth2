@@ -1,9 +1,11 @@
 package jwt
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -59,6 +61,226 @@ func TestValidateAccessToken_RejectRefresh(t *testing.T) {
 	_, err := m.ValidateAccessToken(refreshToken)
 	if err != ErrTokenTypeMismatch {
 		t.Errorf("ValidateAccessToken(refresh) = %v, want ErrTokenTypeMismatch", err)
+	}
+}
+
+func TestValidateAccessToken_RejectIDToken(t *testing.T) {
+	m := newTestManager()
+	uid := uuid.New()
+
+	idToken, err := m.GenerateIDToken(uid, "a@b.com", "user", "user", "client-1", "openid profile", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("GenerateIDToken() error: %v", err)
+	}
+	_, err = m.ValidateAccessToken(idToken)
+	if err != ErrTokenTypeMismatch {
+		t.Errorf("ValidateAccessToken(id_token) = %v, want ErrTokenTypeMismatch", err)
+	}
+}
+
+func TestGenerateIDTokenWithNonceStoresNonceClaim(t *testing.T) {
+	m := newTestManager()
+	uid := uuid.New()
+
+	idToken, err := m.GenerateIDTokenWithNonce(uid, "a@b.com", "user", "user", "client-1", "openid profile", "nonce-123", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("GenerateIDTokenWithNonce() error: %v", err)
+	}
+	claims, err := m.ValidateToken(idToken)
+	if err != nil {
+		t.Fatalf("ValidateToken() error: %v", err)
+	}
+	if claims.Nonce != "nonce-123" {
+		t.Fatalf("Nonce=%q want nonce-123", claims.Nonce)
+	}
+	if claims.TokenType != TokenTypeIDToken {
+		t.Fatalf("TokenType=%q want %q", claims.TokenType, TokenTypeIDToken)
+	}
+}
+
+func TestGenerateTokenWithAuthTimeStoresAuthTimeClaim(t *testing.T) {
+	m := newTestManager()
+	uid := uuid.New()
+	authTime := time.Now().Add(-5 * time.Minute).Unix()
+
+	token, err := m.GenerateTokenWithAuthTime(uid, "a@b.com", "user", "user", TokenTypeAccess, authTime, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("GenerateTokenWithAuthTime() error: %v", err)
+	}
+	claims, err := m.ValidateToken(token)
+	if err != nil {
+		t.Fatalf("ValidateToken() error: %v", err)
+	}
+	if claims.AuthTime != authTime {
+		t.Fatalf("AuthTime=%d want %d", claims.AuthTime, authTime)
+	}
+}
+
+func TestGenerateIDTokenWithNonceAndAuthTimeStoresClaims(t *testing.T) {
+	m := newTestManager()
+	uid := uuid.New()
+	authTime := time.Now().Add(-5 * time.Minute).Unix()
+	atHash := AccessTokenHash("access-token")
+
+	idToken, err := m.GenerateIDTokenWithNonceAndAuthTimeAndAMRAndATHash(uid, "a@b.com", "user", "user", "client-1", "openid profile", "nonce-123", authTime, []string{AuthenticationMethodPassword}, atHash, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("GenerateIDTokenWithNonceAndAuthTimeAndAMRAndATHash() error: %v", err)
+	}
+	claims, err := m.ValidateToken(idToken)
+	if err != nil {
+		t.Fatalf("ValidateToken() error: %v", err)
+	}
+	if claims.Nonce != "nonce-123" {
+		t.Fatalf("Nonce=%q want nonce-123", claims.Nonce)
+	}
+	if claims.AuthTime != authTime {
+		t.Fatalf("AuthTime=%d want %d", claims.AuthTime, authTime)
+	}
+	if len(claims.AMR) != 1 || claims.AMR[0] != AuthenticationMethodPassword {
+		t.Fatalf("AMR=%#v want [%q]", claims.AMR, AuthenticationMethodPassword)
+	}
+	if claims.ATHash != atHash {
+		t.Fatalf("ATHash=%q want %q", claims.ATHash, atHash)
+	}
+	if claims.TokenType != TokenTypeIDToken {
+		t.Fatalf("TokenType=%q want %q", claims.TokenType, TokenTypeIDToken)
+	}
+}
+
+func TestGenerateIDTokenWithoutNonceLeavesNonceClaimEmpty(t *testing.T) {
+	m := newTestManager()
+	uid := uuid.New()
+
+	idToken, err := m.GenerateIDToken(uid, "a@b.com", "user", "user", "client-1", "openid profile", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("GenerateIDToken() error: %v", err)
+	}
+	claims, err := m.ValidateToken(idToken)
+	if err != nil {
+		t.Fatalf("ValidateToken() error: %v", err)
+	}
+	if claims.Nonce != "" {
+		t.Fatalf("Nonce=%q want empty", claims.Nonce)
+	}
+}
+
+func TestGenerateClientIDTokenWithNonceAndAuthTimeUsesClientSecretJWS(t *testing.T) {
+	m := newTestManager()
+	uid := uuid.New()
+	authTime := time.Now().Add(-5 * time.Minute).Unix()
+	atHash := AccessTokenHash("access-token")
+
+	idToken, err := m.GenerateClientIDTokenWithNonceAndAuthTimeAndAMRAndATHash(uid, "a@b.com", "user", "user", "client-1", "client-secret", "openid profile", "nonce-123", authTime, []string{AuthenticationMethodPassword}, atHash, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("GenerateClientIDTokenWithNonceAndAuthTimeAndAMRAndATHash() error: %v", err)
+	}
+	if IsEncryptedToken(idToken) {
+		t.Fatalf("client id_token should be a plain JWS, got encrypted token")
+	}
+	if strings.Count(idToken, ".") != 2 {
+		t.Fatalf("client id_token should be compact JWS, got %q", idToken)
+	}
+
+	claims, err := m.ValidateClientIDToken(idToken, "client-1", "client-secret")
+	if err != nil {
+		t.Fatalf("ValidateClientIDToken() error: %v", err)
+	}
+	if claims.TokenType != TokenTypeIDToken {
+		t.Fatalf("TokenType=%q want %q", claims.TokenType, TokenTypeIDToken)
+	}
+	if claims.ClientID != "client-1" {
+		t.Fatalf("ClientID=%q want client-1", claims.ClientID)
+	}
+	if claims.AuthorizedParty != "client-1" {
+		t.Fatalf("AuthorizedParty=%q want client-1", claims.AuthorizedParty)
+	}
+	if claims.Nonce != "nonce-123" {
+		t.Fatalf("Nonce=%q want nonce-123", claims.Nonce)
+	}
+	if claims.AuthTime != authTime {
+		t.Fatalf("AuthTime=%d want %d", claims.AuthTime, authTime)
+	}
+	if len(claims.AMR) != 1 || claims.AMR[0] != AuthenticationMethodPassword {
+		t.Fatalf("AMR=%#v want [%q]", claims.AMR, AuthenticationMethodPassword)
+	}
+	if claims.ATHash != atHash {
+		t.Fatalf("ATHash=%q want %q", claims.ATHash, atHash)
+	}
+	if _, err := m.ValidateClientIDToken(idToken, "client-1", "wrong-secret"); err != ErrInvalidToken {
+		t.Fatalf("ValidateClientIDToken(wrong secret)=%v want ErrInvalidToken", err)
+	}
+}
+
+func TestValidateClientIDTokenRejectsAuthorizedPartyMismatch(t *testing.T) {
+	m := newTestManager()
+	uid := uuid.New()
+	now := time.Now()
+	token := gojwt.NewWithClaims(gojwt.SigningMethodHS256, &Claims{
+		UserID:          uid,
+		Email:           "a@b.com",
+		Username:        "user",
+		Role:            "user",
+		TokenType:       TokenTypeIDToken,
+		ClientID:        "client-1",
+		AuthorizedParty: "other-client",
+		RegisteredClaims: gojwt.RegisteredClaims{
+			Issuer:    "test-issuer",
+			Subject:   uid.String(),
+			Audience:  gojwt.ClaimStrings{"client-1"},
+			IssuedAt:  gojwt.NewNumericDate(now),
+			ExpiresAt: gojwt.NewNumericDate(now.Add(5 * time.Minute)),
+			NotBefore: gojwt.NewNumericDate(now.Add(-time.Minute)),
+		},
+	})
+	idToken, err := token.SignedString([]byte("client-secret"))
+	if err != nil {
+		t.Fatalf("sign id_token: %v", err)
+	}
+
+	if _, err := m.ValidateClientIDToken(idToken, "client-1", "client-secret"); err != ErrInvalidToken {
+		t.Fatalf("ValidateClientIDToken(azp mismatch)=%v want ErrInvalidToken", err)
+	}
+}
+
+func TestAccessTokenHashUsesOIDCHS256LeftHalf(t *testing.T) {
+	if got := AccessTokenHash("access-token"); got != "Pxa-1wifRlPl7yG_0oJNfw" {
+		t.Fatalf("AccessTokenHash=%q want Pxa-1wifRlPl7yG_0oJNfw", got)
+	}
+	if got := AccessTokenHash(""); got != "" {
+		t.Fatalf("AccessTokenHash(empty)=%q want empty", got)
+	}
+}
+
+func TestGenerateClientIDTokenWithIssuerUsesRequestedIssuer(t *testing.T) {
+	m := newTestManager()
+	uid := uuid.New()
+
+	idToken, err := m.GenerateClientIDTokenWithIssuerAndNonceAndAuthTime(
+		uid,
+		"a@b.com",
+		"user",
+		"user",
+		"client-1",
+		"client-secret",
+		"https://oauth.example.test",
+		"openid profile",
+		"",
+		time.Now().Unix(),
+		5*time.Minute,
+	)
+	if err != nil {
+		t.Fatalf("GenerateClientIDTokenWithIssuerAndNonceAndAuthTime() error: %v", err)
+	}
+
+	claims, err := m.ValidateClientIDTokenWithIssuer(idToken, "client-1", "client-secret", "https://oauth.example.test")
+	if err != nil {
+		t.Fatalf("ValidateClientIDTokenWithIssuer() error: %v", err)
+	}
+	if claims.Issuer != "https://oauth.example.test" {
+		t.Fatalf("Issuer=%q want https://oauth.example.test", claims.Issuer)
+	}
+	if _, err := m.ValidateClientIDToken(idToken, "client-1", "client-secret"); err != ErrInvalidToken {
+		t.Fatalf("ValidateClientIDToken(default issuer)=%v want ErrInvalidToken", err)
 	}
 }
 

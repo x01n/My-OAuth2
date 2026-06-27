@@ -3,8 +3,10 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"runtime"
 	"strings"
 	"time"
@@ -27,6 +29,74 @@ func formatBytes(size int) string {
 		return fmt.Sprintf("%.1fKB", float64(size)/1024)
 	}
 	return fmt.Sprintf("%.1fMB", float64(size)/1024/1024)
+}
+
+func isSensitiveRequestField(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "access_token", "api_key", "api_secret", "client_secret", "code", "code_verifier", "new_password", "old_password", "password", "refresh_token", "token":
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizeQueryString(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return ""
+	}
+	for key := range values {
+		if isSensitiveRequestField(key) {
+			values.Set(key, "***REDACTED***")
+		}
+	}
+	return values.Encode()
+}
+
+func redactJSONValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, nested := range typed {
+			if isSensitiveRequestField(key) {
+				typed[key] = "***REDACTED***"
+				continue
+			}
+			typed[key] = redactJSONValue(nested)
+		}
+		return typed
+	case []any:
+		for i, nested := range typed {
+			typed[i] = redactJSONValue(nested)
+		}
+		return typed
+	default:
+		return value
+	}
+}
+
+func sanitizeBodySnippet(bodySnippet, contentType string) string {
+	if bodySnippet == "" {
+		return ""
+	}
+	lowerContentType := strings.ToLower(contentType)
+	if strings.Contains(lowerContentType, "application/json") {
+		var payload any
+		if err := json.Unmarshal([]byte(bodySnippet), &payload); err != nil {
+			return "[REDACTED BODY OMITTED]"
+		}
+		redacted, err := json.Marshal(redactJSONValue(payload))
+		if err != nil {
+			return "[REDACTED BODY OMITTED]"
+		}
+		return string(redacted)
+	}
+	if strings.Contains(lowerContentType, "application/x-www-form-urlencoded") {
+		return sanitizeQueryString(bodySnippet)
+	}
+	return "[REDACTED BODY OMITTED]"
 }
 
 // TraceID middleware injects trace ID into context
@@ -89,7 +159,7 @@ func RequestLogger() gin.HandlerFunc {
 
 		// Start timer
 		start := time.Now()
-		raw := c.Request.URL.RawQuery
+		raw := sanitizeQueryString(c.Request.URL.RawQuery)
 
 		// Process request
 		c.Next()
@@ -197,7 +267,7 @@ func RecoveryWithLogger() gin.HandlerFunc {
 				}
 				buf := make([]byte, maxRead)
 				n, _ := io.ReadFull(c.Request.Body, buf)
-				bodySnippet = string(buf[:n])
+				bodySnippet = sanitizeBodySnippet(string(buf[:n]), ct)
 				/* 恢复 body 以便后续 handler 读取 */
 				c.Request.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), c.Request.Body))
 			}
@@ -221,7 +291,7 @@ func RecoveryWithLogger() gin.HandlerFunc {
 					"error", fmt.Sprintf("%v", err),
 					"method", c.Request.Method,
 					"path", c.Request.URL.Path,
-					"query", c.Request.URL.RawQuery,
+					"query", sanitizeQueryString(c.Request.URL.RawQuery),
 					"content_type", c.ContentType(),
 					"ip", c.ClientIP(),
 					"user_agent", c.Request.UserAgent(),

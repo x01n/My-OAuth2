@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"net/url"
 
 	"server/internal/service"
 
@@ -61,10 +62,7 @@ func (h *SocialAuthHandler) GetProviders(c *gin.Context) {
  */
 func (h *SocialAuthHandler) StartAuth(c *gin.Context) {
 	providerSlug := c.Param("provider")
-	returnTo := c.Query("return_to")
-	if returnTo == "" {
-		returnTo = "/dashboard"
-	}
+	returnTo := safeReturnPath(c.Query("return_to"))
 
 	// 生成state参数防止CSRF
 	stateBytes := make([]byte, 16)
@@ -111,29 +109,28 @@ func (h *SocialAuthHandler) Callback(c *gin.Context) {
 	state := c.Query("state")
 	errorCode := c.Query("error")
 
-	// 获取前端URL用于重定向
-	frontendURL := c.GetHeader("Origin")
-	if frontendURL == "" {
-		scheme := "http"
-		if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-			scheme = "https"
-		}
-		frontendURL = scheme + "://" + c.Request.Host
+	// 获取同源前端URL用于重定向，不信任客户端可伪造的 Origin 头
+	frontendScheme := "http"
+	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+		frontendScheme = "https"
 	}
+	frontendURL := frontendScheme + "://" + c.Request.Host
 
 	// 获取返回地址
 	returnTo, _ := c.Cookie("oauth_return_to")
-	if returnTo == "" {
-		returnTo = "/dashboard"
-	}
+	returnTo = safeReturnPath(returnTo)
+	savedState, _ := c.Cookie("oauth_state")
 
-	// 清理cookies
+	// 回调结束后清理临时 cookies
 	cbSecure := isRequestSecure(c)
-	setCookie(c, "oauth_state", "", -1, "/", cbSecure, true, http.SameSiteLaxMode)
-	setCookie(c, "oauth_return_to", "", -1, "/", cbSecure, true, http.SameSiteLaxMode)
+	clearCallbackCookies := func() {
+		setCookie(c, "oauth_state", "", -1, "/", cbSecure, true, http.SameSiteLaxMode)
+		setCookie(c, "oauth_return_to", "", -1, "/", cbSecure, true, http.SameSiteLaxMode)
+	}
 
 	// 错误处理函数
 	redirectWithError := func(errMsg string) {
+		clearCallbackCookies()
 		c.Redirect(http.StatusTemporaryRedirect, frontendURL+"/login?error="+errMsg)
 	}
 
@@ -144,7 +141,6 @@ func (h *SocialAuthHandler) Callback(c *gin.Context) {
 	}
 
 	// 验证state
-	savedState, _ := c.Cookie("oauth_state")
 	if savedState == "" || !hmac.Equal([]byte(savedState), []byte(state)) {
 		redirectWithError("invalid_state")
 		return
@@ -189,10 +185,13 @@ func (h *SocialAuthHandler) Callback(c *gin.Context) {
 		redirectWithError("login_failed")
 		return
 	}
-	redirectURL := frontendURL + "/auth/callback?access_token=" + tokens.AccessToken +
-		"&refresh_token=" + tokens.RefreshToken +
-		"&return_to=" + returnTo +
-		"&user_id=" + user.ID.String()
+	clearCallbackCookies()
+	setAuthTokenCookies(c, tokens, 30*24*3600)
+
+	callbackParams := url.Values{}
+	callbackParams.Set("return_to", returnTo)
+	callbackParams.Set("user_id", user.ID.String())
+	redirectURL := frontendURL + "/auth/callback?" + callbackParams.Encode()
 
 	c.Redirect(http.StatusTemporaryRedirect, redirectURL)
 }
@@ -241,6 +240,8 @@ func (h *SocialAuthHandler) LinkAccount(c *gin.Context) {
 			BadRequest(c, "Provider is disabled")
 		case service.ErrIdentityAlreadyLinked:
 			BadRequest(c, "This social account is already linked to another user")
+		case service.ErrProviderAlreadyLinked:
+			BadRequest(c, "This provider is already linked to current user")
 		default:
 			InternalError(c, "Failed to link account")
 		}

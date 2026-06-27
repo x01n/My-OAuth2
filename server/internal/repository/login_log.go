@@ -17,6 +17,14 @@ func NewLoginLogRepository(db *gorm.DB) *LoginLogRepository {
 	return &LoginLogRepository{db: db}
 }
 
+func preloadLoginLogUserSummary(db *gorm.DB) *gorm.DB {
+	return db.Select("id", "email", "username")
+}
+
+func preloadLoginLogAppSummary(db *gorm.DB) *gorm.DB {
+	return db.Select("id", "name")
+}
+
 // Create creates a new login log entry
 func (r *LoginLogRepository) Create(log *model.LoginLog) error {
 	return r.db.Create(log).Error
@@ -51,7 +59,7 @@ func (r *LoginLogRepository) FindByUser(userID uuid.UUID, offset, limit int) ([]
 
 	r.db.Model(&model.LoginLog{}).Where("user_id = ?", userID).Count(&total)
 
-	result := r.db.Preload("App").
+	result := r.db.Preload("App", preloadLoginLogAppSummary).
 		Where("user_id = ?", userID).
 		Order("created_at DESC").
 		Offset(offset).Limit(limit).
@@ -75,7 +83,7 @@ func (r *LoginLogRepository) FindByApp(appID uuid.UUID, offset, limit int) ([]mo
 
 	r.db.Model(&model.LoginLog{}).Where("app_id = ?", appID).Count(&total)
 
-	result := r.db.Preload("User").
+	result := r.db.Preload("User", preloadLoginLogUserSummary).
 		Where("app_id = ?", appID).
 		Order("created_at DESC").
 		Offset(offset).Limit(limit).
@@ -98,7 +106,7 @@ func (r *LoginLogRepository) FindRecent(offset, limit int) ([]model.LoginLog, in
 
 	r.db.Model(&model.LoginLog{}).Count(&total)
 
-	result := r.db.Preload("User").Preload("App").
+	result := r.db.Preload("User", preloadLoginLogUserSummary).Preload("App", preloadLoginLogAppSummary).
 		Order("created_at DESC").
 		Offset(offset).Limit(limit).
 		Find(&logs)
@@ -184,26 +192,88 @@ func (r *LoginLogRepository) GetStatsForUser(userID uuid.UUID) (*model.LoginStat
  * @return []model.LoginTrend - 每日登录趋势数据点列表
  */
 func (r *LoginLogRepository) GetTrend(days int) ([]model.LoginTrend, error) {
-	var trends []model.LoginTrend
-
 	startDate := time.Now().AddDate(0, 0, -days).Truncate(24 * time.Hour)
+	endDate := startDate.AddDate(0, 0, days+1)
 
-	// SQLite and PostgreSQL have different date functions
-	// Using a simple approach that works for both
+	dateExpr, ok := loginTrendDateExpr(r.db.Dialector.Name())
+	if !ok {
+		return r.getTrendByDailyCounts(startDate, days)
+	}
+
+	type trendRow struct {
+		Date       string
+		TotalCount int64
+		Success    int64
+		Failed     int64
+	}
+	var rows []trendRow
+
+	if err := r.db.Model(&model.LoginLog{}).
+		Select(dateExpr+" AS date, COUNT(*) AS total_count, SUM(CASE WHEN success = ? THEN 1 ELSE 0 END) AS success, SUM(CASE WHEN success = ? THEN 1 ELSE 0 END) AS failed", true, false).
+		Where("created_at >= ? AND created_at < ?", startDate, endDate).
+		Group(dateExpr).
+		Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	byDate := make(map[string]model.LoginTrend, len(rows))
+	for _, row := range rows {
+		byDate[row.Date] = model.LoginTrend{
+			Date:       row.Date,
+			TotalCount: row.TotalCount,
+			Success:    row.Success,
+			Failed:     row.Failed,
+		}
+	}
+
+	trends := make([]model.LoginTrend, 0, days+1)
+	for i := 0; i <= days; i++ {
+		date := startDate.AddDate(0, 0, i).Format("2006-01-02")
+		if trend, exists := byDate[date]; exists {
+			trends = append(trends, trend)
+			continue
+		}
+		trends = append(trends, model.LoginTrend{Date: date})
+	}
+
+	return trends, nil
+}
+
+func loginTrendDateExpr(dialectorName string) (string, bool) {
+	switch dialectorName {
+	case "sqlite":
+		return "date(created_at)", true
+	case "postgres":
+		return "to_char(created_at, 'YYYY-MM-DD')", true
+	case "mysql":
+		return "DATE_FORMAT(created_at, '%Y-%m-%d')", true
+	default:
+		return "", false
+	}
+}
+
+func (r *LoginLogRepository) getTrendByDailyCounts(startDate time.Time, days int) ([]model.LoginTrend, error) {
+	trends := make([]model.LoginTrend, 0, days+1)
 	for i := 0; i <= days; i++ {
 		date := startDate.AddDate(0, 0, i)
 		nextDate := date.AddDate(0, 0, 1)
 
 		var total, success, failed int64
-		r.db.Model(&model.LoginLog{}).
+		if err := r.db.Model(&model.LoginLog{}).
 			Where("created_at >= ? AND created_at < ?", date, nextDate).
-			Count(&total)
-		r.db.Model(&model.LoginLog{}).
-			Where("created_at >= ? AND created_at < ? AND success = true", date, nextDate).
-			Count(&success)
-		r.db.Model(&model.LoginLog{}).
-			Where("created_at >= ? AND created_at < ? AND success = false", date, nextDate).
-			Count(&failed)
+			Count(&total).Error; err != nil {
+			return nil, err
+		}
+		if err := r.db.Model(&model.LoginLog{}).
+			Where("created_at >= ? AND created_at < ? AND success = ?", date, nextDate, true).
+			Count(&success).Error; err != nil {
+			return nil, err
+		}
+		if err := r.db.Model(&model.LoginLog{}).
+			Where("created_at >= ? AND created_at < ? AND success = ?", date, nextDate, false).
+			Count(&failed).Error; err != nil {
+			return nil, err
+		}
 
 		trends = append(trends, model.LoginTrend{
 			Date:       date.Format("2006-01-02"),
@@ -212,7 +282,6 @@ func (r *LoginLogRepository) GetTrend(days int) ([]model.LoginTrend, error) {
 			Failed:     failed,
 		})
 	}
-
 	return trends, nil
 }
 

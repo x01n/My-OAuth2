@@ -30,15 +30,15 @@ func TestEncryptedToken_NotPlainJWT(t *testing.T) {
 	}
 }
 
-func TestEncryptedIDToken_RoundTrip(t *testing.T) {
+func TestEncryptedInternalIDToken_RoundTrip(t *testing.T) {
 	m := newTestManager()
 	uid := uuid.New()
-	token, err := m.GenerateIDToken(uid, "a@b.com", "user", "user", "client-1", "openid profile", time.Hour)
+	token, err := m.GenerateIDToken(uid, "a@b.com", "user", "user", "", "openid profile", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !IsEncryptedToken(token) {
-		t.Fatal("id_token should be encrypted")
+		t.Fatal("internal id_token should be encrypted")
 	}
 	claims, err := m.ValidateToken(token)
 	if err != nil || claims.TokenType != TokenTypeIDToken {

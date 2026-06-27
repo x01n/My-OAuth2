@@ -11,8 +11,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"html/template"
 	"io"
 	"log"
@@ -29,6 +32,7 @@ import (
 )
 
 var client *oauth2.Client
+
 const defaultOAuthServerURL = "http://localhost:28080"
 const testRedirectURL = "http://localhost:9000/callback"
 
@@ -69,14 +73,34 @@ func main() {
 	}
 
 	// 配置 OAuth2 客户端 - 替换为你的实际值
-	clientID = getEnvOrDefault("OAUTH_CLIENT_ID", "db84c0d44df5b5a611d0e498c769023c")
-	clientSecret = getEnvOrDefault("OAUTH_CLIENT_SECRET", "5ffb4224b5de948c0a38d3459b4e600635c9356c8a09cbd000c949543c1def2c")
+	clientID = getEnvOrDefault("OAUTH_CLIENT_ID", "d8537f320ca0231dad67a0f63ad9372a")
+	clientSecret = getEnvOrDefault("OAUTH_CLIENT_SECRET", "ddcc03040d7753b88336dd70fb2fdb8675f2835da6c80470caf1712e26c44744")
 	serverURL = getEnvOrDefault("OAUTH_SERVER_URL", defaultOAuthServerURL)
 
 	var err error
 	client, err = oauth2.NewClient(buildTestOAuthConfig())
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
+	}
+
+	// 初始化 SSO demo client（可选，失败不影响主流程）
+	ctx := context.Background()
+	ssoIssuer := getEnvOrDefault("OAUTH_SSO_ISSUER", serverURL)
+	ssoClientID := getEnvOrDefault("OAUTH_SSO_CLIENT_ID", clientID)
+	ssoClientSecret := getEnvOrDefault("OAUTH_SSO_CLIENT_SECRET", clientSecret)
+	ssoRedirect := getEnvOrDefault("OAUTH_SSO_REDIRECT", "http://localhost:9000/sso/callback")
+	{
+		cfg, derr := oauth2.DiscoverSSOConfig(ctx, ssoClientID, ssoClientSecret, ssoIssuer, ssoRedirect)
+		if derr != nil {
+			// 回退到静态 SSO 配置
+			cfg = oauth2.SSOConfig(ssoClientID, ssoClientSecret, ssoIssuer, ssoRedirect)
+		}
+		ssoClient, err = oauth2.NewClient(cfg)
+		if err != nil {
+			log.Printf("Warning: failed to initialize SSO client: %v", err)
+			ssoClient = nil
+		}
+		ssoSessions = newSessionStore()
 	}
 
 	// 路由
@@ -91,6 +115,12 @@ func main() {
 	http.HandleFunc("/webhook-test", handleWebhookTest)
 	http.HandleFunc("/token-info", handleTokenInfo)
 	http.HandleFunc("/oidc-test", handleOIDCTest)
+	// SSO demo (作为业务系统接入本平台统一认证)
+	http.HandleFunc("/sso", handleSSOHome)
+	http.HandleFunc("/sso/login", handleSSOLogin)
+	http.HandleFunc("/sso/callback", handleSSOCallback)
+	http.HandleFunc("/sso/me", handleSSOMe)
+	http.HandleFunc("/sso/logout", handleSSOLogout)
 	// 新增功能
 	http.HandleFunc("/device", handleDeviceFlow)
 	http.HandleFunc("/client-credentials", handleClientCredentials)
@@ -118,6 +148,7 @@ func main() {
 	fmt.Println("║  - /oidc-test          OIDC 综合测试                     ║")
 	fmt.Println("║  - /oidc               OIDC发现文档                      ║")
 	fmt.Println("║  - /webhook-test       Webhook测试                       ║")
+	fmt.Println("║  - /sso                SSO Demo (业务系统接入示例)      ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════╣")
 	fmt.Println("║  CLI模式: ./test [命令]                                  ║")
 	fmt.Println("║  命令: device | login | client-creds | exchange | help   ║")
@@ -916,6 +947,7 @@ type oidcTestResult struct {
  */
 func handleOIDCTest(w http.ResponseWriter, r *http.Request) {
 	var results []oidcTestResult
+	var idTokenAlgs []string
 
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 
@@ -957,6 +989,13 @@ func handleOIDCTest(w http.ResponseWriter, r *http.Request) {
 				results = append(results, oidcTestResult{"Discovery 必填字段: " + field, "Discovery", false, "缺失", 0})
 			}
 		}
+		if raw, ok := doc["id_token_signing_alg_values_supported"].([]interface{}); ok {
+			for _, item := range raw {
+				if alg, ok := item.(string); ok {
+					idTokenAlgs = append(idTokenAlgs, alg)
+				}
+			}
+		}
 
 		/* 校验推荐字段 */
 		recommendedFields := []string{"userinfo_endpoint", "revocation_endpoint", "introspection_endpoint", "scopes_supported"}
@@ -990,11 +1029,26 @@ func handleOIDCTest(w http.ResponseWriter, r *http.Request) {
 		}
 
 		keys, ok := jwks["keys"].([]interface{})
-		if !ok || len(keys) == 0 {
-			results = append(results, oidcTestResult{"JWKS 包含密钥", "JWKS", false, "keys 数组为空或不存在", 0})
+		if !ok {
+			results = append(results, oidcTestResult{"JWKS keys 数组", "JWKS", false, "keys 缺失或不是数组", 0})
 			return
 		}
-		results = append(results, oidcTestResult{"JWKS 包含密钥", "JWKS", true, fmt.Sprintf("%d 个密钥", len(keys)), 0})
+		requiresAsymmetricJWK := false
+		for _, alg := range idTokenAlgs {
+			if alg == "RS256" {
+				requiresAsymmetricJWK = true
+				break
+			}
+		}
+		if !requiresAsymmetricJWK {
+			results = append(results, oidcTestResult{"JWKS 密钥集合", "JWKS", len(keys) == 0, fmt.Sprintf("id_token alg=%v, keys=%d", idTokenAlgs, len(keys)), 0})
+			return
+		}
+		if len(keys) == 0 {
+			results = append(results, oidcTestResult{"JWKS 包含 RS256 密钥", "JWKS", false, "RS256 需要公开签名 key", 0})
+			return
+		}
+		results = append(results, oidcTestResult{"JWKS 包含 RS256 密钥", "JWKS", true, fmt.Sprintf("%d 个密钥", len(keys)), 0})
 
 		/* 校验第一个 key 的必要字段 */
 		if key, ok := keys[0].(map[string]interface{}); ok {
@@ -2256,3 +2310,137 @@ h1 { color: #1e293b; }
 
 // init 确保使用了bytes包
 var _ = bytes.Buffer{}
+
+// ---------------- SSO Demo 支持 ----------------
+var ssoClient *oauth2.Client
+var ssoSessions *sessionStore
+var ssoCookieName = "sso_demo_session"
+
+type appSession struct {
+	AccessToken string
+	UserInfo    *oauth2.UserInfo
+	CreatedAt   time.Time
+}
+
+type sessionStore struct {
+	mu       sync.RWMutex
+	sessions map[string]*appSession
+}
+
+func newSessionStore() *sessionStore {
+	return &sessionStore{sessions: make(map[string]*appSession)}
+}
+
+func (s *sessionStore) create(session *appSession) (string, error) {
+	id, err := randomURLSafe(32)
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	s.sessions[id] = session
+	s.mu.Unlock()
+	return id, nil
+}
+
+func (s *sessionStore) get(id string) (*appSession, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.sessions[id]
+	return v, ok
+}
+
+func (s *sessionStore) delete(id string) {
+	s.mu.Lock()
+	delete(s.sessions, id)
+	s.mu.Unlock()
+}
+
+func randomURLSafe(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func handleSSOHome(w http.ResponseWriter, r *http.Request) {
+	if ssoClient == nil {
+		renderMessage(w, "SSO 未启用", "SSO 客户端未初始化或发现失败（可通过环境变量 OAUTH_SSO_ISSUER 等配置）", "error")
+		return
+	}
+	session, ok := currentSSOSession(r)
+	if ok && session != nil {
+		// 已登录
+		html := fmt.Sprintf(`<!doctype html><html><head><meta charset="utf-8"><title>SSO Demo</title></head><body><h1>SSO Demo</h1><p>已通过本平台统一认证登录。</p><ul><li>User ID: %s</li><li>Email: %s</li><li>Name: %s</li></ul><p><a href="/sso/me">查看当前会话 JSON</a></p><p><a href="/sso/logout">退出业务系统会话</a></p><p><a href="/">返回测试首页</a></p></body></html>`, html.EscapeString(session.UserInfo.Sub), html.EscapeString(session.UserInfo.Email), html.EscapeString(session.UserInfo.Name))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+		return
+	}
+	// 未登录
+	htmlBody := `<!doctype html><html><head><meta charset="utf-8"><title>SSO Demo</title></head><body><h1>SSO Demo</h1><p>当前业务系统未登录。</p><p><a href="/sso/login">使用本平台统一登录</a></p><p><a href="/">返回测试首页</a></p></body></html>`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(htmlBody))
+}
+
+func handleSSOLogin(w http.ResponseWriter, r *http.Request) {
+	if ssoClient == nil {
+		renderMessage(w, "SSO 未启用", "SSO 客户端未初始化", "error")
+		return
+	}
+	authURL, err := ssoClient.AuthCodeURL()
+	if err != nil {
+		renderMessage(w, "错误", fmt.Sprintf("获取授权地址失败: %v", err), "error")
+		return
+	}
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+func handleSSOCallback(w http.ResponseWriter, r *http.Request) {
+	if ssoClient == nil {
+		renderMessage(w, "SSO 未启用", "SSO 客户端未初始化", "error")
+		return
+	}
+	result, err := ssoClient.HandleCallback(r.Context(), oauth2.CallbackRequestFromHTTPRequest(r))
+	if err != nil {
+		renderMessage(w, "回调错误", fmt.Sprintf("Callback 处理失败: %v", err), "error")
+		return
+	}
+	if result == nil || result.UserInfo == nil {
+		renderMessage(w, "错误", "回调未返回用户信息", "error")
+		return
+	}
+	sessID, err := ssoSessions.create(&appSession{AccessToken: result.Token.AccessToken, UserInfo: result.UserInfo, CreatedAt: time.Now()})
+	if err != nil {
+		renderMessage(w, "错误", fmt.Sprintf("创建会话失败: %v", err), "error")
+		return
+	}
+	ssoRedirect := getEnvOrDefault("OAUTH_SSO_REDIRECT", "http://localhost:9000/sso/callback")
+	http.SetCookie(w, &http.Cookie{Name: ssoCookieName, Value: sessID, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 3600, Secure: strings.HasPrefix(ssoRedirect, "https://")})
+	http.Redirect(w, r, "/sso", http.StatusFound)
+}
+
+func handleSSOMe(w http.ResponseWriter, r *http.Request) {
+	session, ok := currentSSOSession(r)
+	if !ok || session == nil {
+		renderJSON(w, "未登录", "/sso/me", `{"error":"not logged in"}`)
+		return
+	}
+	data, _ := json.MarshalIndent(map[string]interface{}{"user": session.UserInfo, "created_at": session.CreatedAt}, "", "  ")
+	renderJSON(w, "当前会话", "/sso/me", string(data))
+}
+
+func handleSSOLogout(w http.ResponseWriter, r *http.Request) {
+	if cookie, err := r.Cookie(ssoCookieName); err == nil {
+		ssoSessions.delete(cookie.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: ssoCookieName, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1})
+	http.Redirect(w, r, "/sso", http.StatusFound)
+}
+
+func currentSSOSession(r *http.Request) (*appSession, bool) {
+	cookie, err := r.Cookie(ssoCookieName)
+	if err != nil || cookie.Value == "" {
+		return nil, false
+	}
+	return ssoSessions.get(cookie.Value)
+}

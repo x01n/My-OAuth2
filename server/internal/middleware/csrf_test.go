@@ -5,7 +5,12 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"server/internal/model"
+	"server/internal/repository"
+
 	"github.com/gin-gonic/gin"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 func init() {
@@ -23,6 +28,26 @@ func setupCSRFRouter() *gin.Engine {
 		c.JSON(200, gin.H{"ok": true})
 	})
 	return r
+}
+
+func setupCSRFRouterWithRiskEvents(t *testing.T) (*gin.Engine, *gorm.DB) {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{SkipDefaultTransaction: true})
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	if err := db.AutoMigrate(&model.RiskEvent{}); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	r := gin.New()
+	r.Use(CSRFProtectionWithRiskEventRepository(repository.NewRiskEventRepository(db)))
+	r.POST("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"ok": true})
+	})
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"ok": true})
+	})
+	return r, db
 }
 
 func TestCSRF_GET_Bypass(t *testing.T) {
@@ -55,6 +80,52 @@ func TestCSRF_POST_MissingCookie(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != 403 {
 		t.Errorf("POST without CSRF cookie should be 403, got %d", w.Code)
+	}
+}
+
+func TestCSRF_POST_MissingCookie_RecordsRiskEvent(t *testing.T) {
+	r, db := setupCSRFRouterWithRiskEvents(t)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/test", nil)
+	req.Host = "localhost"
+	req.RemoteAddr = "203.0.113.50:12345"
+	req.Header.Set("Origin", "http://localhost")
+	req.Header.Set("User-Agent", "csrf-risk-test")
+	r.ServeHTTP(w, req)
+	if w.Code != 403 {
+		t.Errorf("POST without CSRF cookie should be 403, got %d", w.Code)
+	}
+
+	var event model.RiskEvent
+	if err := db.Where("user_id IS NULL AND risk_score = ? AND decision = ?", 50, model.RiskDecisionChallenge).
+		First(&event).Error; err != nil {
+		t.Fatalf("find risk event: %v", err)
+	}
+	if event.IPAddress != "203.0.113.50" {
+		t.Fatalf("ip_address=%q want 203.0.113.50", event.IPAddress)
+	}
+	if event.UserAgent != "csrf-risk-test" {
+		t.Fatalf("user_agent=%q want csrf-risk-test", event.UserAgent)
+	}
+	if event.Reason != model.RiskEventReasonCSRFTokenMissing {
+		t.Fatalf("reason=%q want %q", event.Reason, model.RiskEventReasonCSRFTokenMissing)
+	}
+}
+
+func TestCSRF_POST_WithAuthHeader_DoesNotRecordRiskEvent(t *testing.T) {
+	r, db := setupCSRFRouterWithRiskEvents(t)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/test", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Errorf("POST with Authorization header should bypass CSRF, got %d", w.Code)
+	}
+
+	var count int64
+	db.Model(&model.RiskEvent{}).Count(&count)
+	if count != 0 {
+		t.Fatalf("risk event count=%d want 0", count)
 	}
 }
 

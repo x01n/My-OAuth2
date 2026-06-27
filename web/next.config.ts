@@ -33,7 +33,7 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: process.cwd(),
   },
-  /* Next.js 16 自动生成的 .next/types/validator.ts 存在类型导出缺陷，跳过构建时类型检查 */
+  /* 跳过 Next 内置类型检查；scripts/build.js 已先执行 tsc --noEmit */
   typescript: {
     ignoreBuildErrors: true,
   },

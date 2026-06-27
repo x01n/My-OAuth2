@@ -51,14 +51,7 @@ func (c *Client) EchoMiddleware() echo.MiddlewareFunc {
 			token := parts[1]
 
 			// Validate token with OAuth2 server
-			tempStore := NewMemoryTokenStore()
-			tempStore.SetToken(&Token{AccessToken: token})
-			oldStore := c.tokenStore
-			c.tokenStore = tempStore
-
-			userInfo, err := c.GetUserInfo(ctx.Request().Context())
-			c.tokenStore = oldStore
-
+			userInfo, err := c.getUserInfoWithAccessToken(ctx.Request().Context(), token)
 			if err != nil {
 				c.logger.Error("Token validation failed", "error", err)
 				return ctx.JSON(http.StatusUnauthorized, map[string]interface{}{
@@ -125,14 +118,7 @@ func (c *Client) EchoMiddlewareWithOptions(opts EchoMiddlewareOptions) echo.Midd
 			token := parts[1]
 
 			// Validate token with OAuth2 server
-			tempStore := NewMemoryTokenStore()
-			tempStore.SetToken(&Token{AccessToken: token})
-			oldStore := c.tokenStore
-			c.tokenStore = tempStore
-
-			userInfo, err := c.GetUserInfo(ctx.Request().Context())
-			c.tokenStore = oldStore
-
+			userInfo, err := c.getUserInfoWithAccessToken(ctx.Request().Context(), token)
 			if err != nil {
 				c.logger.Error("Token validation failed", "error", err)
 				if opts.AllowAnonymous {

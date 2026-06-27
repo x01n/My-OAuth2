@@ -29,7 +29,7 @@ My-OAuth2/
 │   └── lib/         # 工具库（api/i18n/auth）
 └── clinet/          # Go 客户端 SDK（支持 Gin/Echo/标准库集成）
     ├── oauth2/      # SDK 核心
-    └── examples/    # 8 个完整示例
+    └── examples/    # 9 个完整示例
 ```
 
 ## 核心特性
@@ -45,6 +45,7 @@ My-OAuth2/
 | **令牌内省** | Token 有效性查询 | RFC 7662 |
 | **OIDC 发现** | .well-known + JWKS | OpenID Connect |
 | **Token 轮换** | Refresh Token 单次使用 + 重放检测 | — |
+| **SSO 接入** | 业务系统通过 OAuth2/OIDC 授权码流接入统一登录 | — |
 | **联邦认证** | GitHub/Google/自定义 SSO 登录 | — |
 | **邮件队列** | 数据库持久化、后台 Worker、失败重试 | — |
 | **Webhook** | HMAC-SHA256 签名、指数退避重试 | — |
@@ -182,6 +183,22 @@ userInfo, _ := client.GetUserInfo(ctx)
 | GET | `/.well-known/jwks.json` | JSON Web Key Set |
 | GET | `/.well-known/webfinger` | WebFinger |
 
+### SSO 接入（业务系统）
+
+其他平台接入本平台 SSO 时，本平台作为 OAuth2/OIDC Provider，业务系统作为 OAuth Client：
+
+| 用途 | 端点 |
+|------|------|
+| 发现配置 | `/.well-known/openid-configuration` |
+| 发起统一登录 | `/oauth/authorize` |
+| 授权码换 Token | `/oauth/token` |
+| 获取当前用户 | `/oauth/userinfo` |
+| 统一登出 | `/oauth/logout` |
+
+接入流程：在管理后台创建应用并配置 `redirect_uris`，业务系统使用 Authorization Code + PKCE 跳转到 `/oauth/authorize`，回调后用 `code` 调 `/oauth/token`，再通过 `/oauth/userinfo` 获取统一用户身份。
+
+Go SDK 接入时优先使用 `DiscoverSSOConfig(...)` 读取 `/.well-known/openid-configuration` 并校验 `issuer`；无法访问 Discovery 时可使用 `SSOConfig(...)` 从认证中心根地址显式派生端点。完整业务系统示例位于 `clinet/examples/sso/`，覆盖统一登录跳转、授权回调、HttpOnly 业务会话和 Bearer Token API 保护路由。
+
 ### SDK (`/api/sdk/`)
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -297,8 +314,9 @@ cd server && go run ./cmd
 # 前端开发
 cd web && pnpm dev
 
-# SDK 示例（8 个完整示例）
+# SDK 示例（9 个完整示例）
 cd clinet/examples/test && go run main.go           # 综合测试
+cd clinet/examples/sso && go run main.go            # SSO 业务系统接入
 cd clinet/examples/gin && go run main.go            # Gin 集成
 cd clinet/examples/echo && go run main.go           # Echo 集成
 cd clinet/examples/device && go run main.go         # Device Flow

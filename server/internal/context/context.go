@@ -29,6 +29,12 @@ const (
 
 	/** 颁发方 client_id；""=中央 token；非空=外部 SDK token */
 	ClientIDKey = "auth_client_id"
+
+	/** 终端用户最近一次完成认证的 Unix 秒级时间 */
+	AuthTimeKey = "auth_time"
+
+	/** OIDC Authentication Methods References */
+	AuthMethodsKey = "auth_methods"
 )
 
 /**
@@ -55,6 +61,26 @@ func SetUser(c *gin.Context, userID uuid.UUID, email, username, role string) {
  */
 func SetClientID(c *gin.Context, clientID string) {
 	c.Set(ClientIDKey, clientID)
+}
+
+/**
+ * SetAuthTime 写入 JWT 携带的 auth_time
+ *
+ * @param  {*gin.Context} c
+ * @param  {int64}        authTime - Unix 秒级时间；0 表示未知
+ */
+func SetAuthTime(c *gin.Context, authTime int64) {
+	c.Set(AuthTimeKey, authTime)
+}
+
+/**
+ * SetAuthMethods 写入 OIDC amr 认证方法列表
+ *
+ * @param  {*gin.Context} c
+ * @param  {[]string}     methods - RFC 8176 amr 值，如 "pwd"
+ */
+func SetAuthMethods(c *gin.Context, methods []string) {
+	c.Set(AuthMethodsKey, append([]string(nil), methods...))
 }
 
 /**
@@ -130,6 +156,39 @@ func GetClientID(c *gin.Context) string {
 	}
 	s, _ := v.(string)
 	return s
+}
+
+/**
+ * GetAuthTime 从上下文提取 auth_time
+ *
+ * @param  {*gin.Context} c
+ * @returns {(int64, bool)}
+ */
+func GetAuthTime(c *gin.Context) (int64, bool) {
+	v, exists := c.Get(AuthTimeKey)
+	if !exists {
+		return 0, false
+	}
+	authTime, ok := v.(int64)
+	return authTime, ok
+}
+
+/**
+ * GetAuthMethods 从上下文提取 OIDC amr 认证方法列表
+ *
+ * @param  {*gin.Context} c
+ * @returns {([]string, bool)}
+ */
+func GetAuthMethods(c *gin.Context) ([]string, bool) {
+	v, exists := c.Get(AuthMethodsKey)
+	if !exists {
+		return nil, false
+	}
+	methods, ok := v.([]string)
+	if !ok {
+		return nil, false
+	}
+	return append([]string(nil), methods...), true
 }
 
 /**

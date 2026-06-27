@@ -2,7 +2,9 @@ package repository
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -69,7 +71,8 @@ func (r *OAuthRepository) FindAuthorizationCode(code string) (*model.Authorizati
  */
 func (r *OAuthRepository) FindReusableAuthorizationCode(
 	userID uuid.UUID,
-	clientID, redirectURI, scope, codeChallenge string,
+	clientID, redirectURI, scope, codeChallenge, nonce string,
+	maxAge int64,
 ) (*model.AuthorizationCode, error) {
 	var authCode model.AuthorizationCode
 	q := r.db.Where(
@@ -81,6 +84,12 @@ func (r *OAuthRepository) FindReusableAuthorizationCode(
 	} else {
 		q = q.Where("(code_challenge = '' OR code_challenge IS NULL)")
 	}
+	if nonce != "" {
+		q = q.Where("nonce = ?", nonce)
+	} else {
+		q = q.Where("(nonce = '' OR nonce IS NULL)")
+	}
+	q = q.Where("max_age = ?", maxAge)
 	err := q.Order("created_at DESC").First(&authCode).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -130,8 +139,17 @@ func (r *OAuthRepository) DeleteExpiredAuthorizationCodes() error {
 func (r *OAuthRepository) CreateAccessToken(token *model.AccessToken) error {
 	if token.Token == "" {
 		token.Token = generateToken()
+		return r.db.Create(token).Error
 	}
-	return r.db.Create(token).Error
+
+	issuedToken := token.Token
+	token.Token = accessTokenLookupValue(issuedToken)
+	if err := r.db.Create(token).Error; err != nil {
+		token.Token = issuedToken
+		return err
+	}
+	token.Token = issuedToken
+	return nil
 }
 
 /*
@@ -141,13 +159,19 @@ func (r *OAuthRepository) CreateAccessToken(token *model.AccessToken) error {
  */
 func (r *OAuthRepository) FindAccessToken(token string) (*model.AccessToken, error) {
 	var accessToken model.AccessToken
-	result := r.db.Preload("User").First(&accessToken, "token = ?", token)
+	lookupToken := accessTokenLookupValue(token)
+	lookupValues := []string{lookupToken}
+	if lookupToken != token {
+		lookupValues = append(lookupValues, token)
+	}
+	result := r.db.Preload("User").First(&accessToken, "token IN ?", lookupValues)
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return nil, ErrTokenNotFound
 		}
 		return nil, result.Error
 	}
+	accessToken.Token = token
 	return &accessToken, nil
 }
 
@@ -169,7 +193,12 @@ func (r *OAuthRepository) FindAccessTokenByID(id uuid.UUID) (*model.AccessToken,
 
 /* RevokeAccessToken 撤销访问令牌 */
 func (r *OAuthRepository) RevokeAccessToken(token string) error {
-	return r.db.Model(&model.AccessToken{}).Where("token = ?", token).Update("revoked", true).Error
+	lookupToken := accessTokenLookupValue(token)
+	lookupValues := []string{lookupToken}
+	if lookupToken != token {
+		lookupValues = append(lookupValues, token)
+	}
+	return r.db.Model(&model.AccessToken{}).Where("token IN ?", lookupValues).Update("revoked", true).Error
 }
 
 /*
@@ -243,7 +272,7 @@ func (r *OAuthRepository) RevokeTokensByClientAndUser(clientID string, userID uu
 	}
 	/* 撤销关联的所有 refresh_token（通过子查询找到 access_token_id） */
 	return r.db.Exec(`
-		UPDATE refresh_tokens SET revoked = true 
+		UPDATE refresh_tokens SET revoked = true
 		WHERE revoked = false AND access_token_id IN (
 			SELECT id FROM access_tokens WHERE client_id = ? AND user_id = ?
 		)`, clientID, userID).Error
@@ -381,4 +410,25 @@ func generateToken() string {
 		panic("crypto/rand failed: " + err.Error())
 	}
 	return base64.URLEncoding.EncodeToString(bytes)
+}
+
+func accessTokenLookupValue(token string) string {
+	if token == "" || len(token) <= 500 || isAccessTokenHash(token) {
+		return token
+	}
+	sum := sha256.Sum256([]byte(token))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func isAccessTokenHash(token string) bool {
+	const prefix = "sha256:"
+	if len(token) != 71 || len(token) < len(prefix) || token[:len(prefix)] != prefix {
+		return false
+	}
+	for _, ch := range token[len(prefix):] {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
 }
